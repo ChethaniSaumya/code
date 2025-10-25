@@ -1,0 +1,1182 @@
+"""
+ENHANCED BINARY OPTIONS PREDICTOR
+Combines: full_OHLC_regimes_different_prices3.py + chatgpt_v3.py
+Features: OHLC Cycle Detection + ML Classifier + Proper Backtesting
+"""
+
+import pandas as pd
+import numpy as np
+import requests
+from datetime import datetime, timedelta, timezone
+from scipy.signal import hilbert, detrend
+from scipy.fft import rfft, rfftfreq
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import json
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+class EnhancedBinaryOptionsPredictor:
+    """
+    Enhanced Binary Options Predictor
+    - OHLC cycle detection (from full_OHLC_regimes_different_prices3.py)
+    - ML classification (from chatgpt_v3.py)
+    - Proper backtesting with confidence filtering
+    """
+    
+    def __init__(self):
+        self.API_BASE = "https://api.binomo.com/candles/v1/Z-CRY%2FIDX"
+        self.HEADERS = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        }
+        self.utc = timezone.utc
+        self.ist = timezone(timedelta(hours=5, minutes=30))  # IST = UTC+5:30
+        self.candle_interval = 5
+        
+        # Cycle parameters
+        self.min_cycle_period = 10
+        self.max_cycle_period = 50
+        self.dominant_period = None
+        self.best_cycles = {}
+        
+        # ML models
+        self.rf_model = None
+        self.gb_model = None
+        self.feature_cols = []
+        
+        # Data storage
+        self.training_data = None
+        self.validation_data = None
+        self.today_data = None
+        self.validation_predictions = None
+        self.today_predictions = None
+        
+        # Output directory
+        self.output_dir = "ENHANCED_BINARY_OUTPUT"
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+        
+        # Date tracking
+        utc_now = datetime.now(self.utc)
+        self.day_before_yesterday = (utc_now - timedelta(days=2)).strftime('%Y-%m-%d')
+        self.yesterday = (utc_now - timedelta(days=1)).strftime('%Y-%m-%d')
+        self.today = utc_now.strftime('%Y-%m-%d')
+        
+        print("=" * 80)
+        print("🎯 ENHANCED BINARY OPTIONS PREDICTOR")
+        print("=" * 80)
+        print(f"📅 Training Date: {self.day_before_yesterday}")
+        print(f"📅 Validation Date: {self.yesterday}")
+        print(f"📅 Prediction Date: {self.today}")
+        print("=" * 80)
+
+    # ========================================================================
+    # DATA FETCHING (from full_OHLC_regimes_different_prices3.py)
+    # ========================================================================
+    
+    def parse_api_timestamp(self, timestamp_str):
+        """Parse API timestamp to UTC"""
+        try:
+            if timestamp_str.endswith('Z'):
+                dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            else:
+                dt = datetime.fromisoformat(timestamp_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=self.utc)
+            return dt
+        except Exception as e:
+            print(f"❌ Error parsing timestamp {timestamp_str}: {e}")
+            return None
+    
+    def fetch_day_data(self, days_ago, label="Data"):
+        """Fetch data for specific day"""
+        print(f"\n{'='*80}")
+        print(f"📥 FETCHING {label.upper()}")
+        print(f"{'='*80}")
+        
+        utc_now = datetime.now(self.utc)
+        target_date = (utc_now - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        date_str = target_date.strftime("%Y-%m-%dT00:00:00")
+        url = f"{self.API_BASE}/{date_str}/60?locale=en"
+        
+        print(f"Date: {target_date.strftime('%Y-%m-%d')} (UTC)")
+        print(f"Fetching 1-minute candles...", end=" ")
+        
+        try:
+            response = requests.get(url, headers=self.HEADERS, timeout=10)
+            if response.status_code == 200:
+                api_data = response.json()
+                
+                if 'data' in api_data and len(api_data['data']) > 0:
+                    candles = []
+                    for candle in api_data['data']:
+                        dt = self.parse_api_timestamp(candle['created_at'])
+                        if dt is None:
+                            continue
+                        
+                        if dt.date() == target_date.date():
+                            candles.append({
+                                'timestamp': dt,
+                                'open': float(candle['open']),
+                                'high': float(candle['high']),
+                                'low': float(candle['low']),
+                                'close': float(candle['close'])
+                            })
+                    
+                    print(f"✓ {len(candles)} candles")
+                    
+                    if not candles:
+                        print(f"✗ No data")
+                        return None
+                    
+                    df = pd.DataFrame(candles)
+                    df = df.sort_values('timestamp').reset_index(drop=True)
+                    
+                    print(f"Aggregating to {self.candle_interval}-min...", end=" ")
+                    df['time_floor'] = df['timestamp'].dt.floor(f'{self.candle_interval}min')
+                    df_agg = df.groupby('time_floor').agg({
+                        'open': 'first',
+                        'high': 'max',
+                        'low': 'min',
+                        'close': 'last'
+                    }).reset_index()
+                    df_agg = df_agg.rename(columns={'time_floor': 'timestamp'})
+                    
+                    print(f"✓ {len(df_agg)} 5-min candles")
+                    return df_agg
+                else:
+                    print(f"✗ No data in API response")
+                    return None
+                    
+        except Exception as e:
+            print(f"✗ API Error: {e}")
+            return None
+
+    # ========================================================================
+    # ENHANCED CYCLE DETECTION (FFT + Median Search)
+    # ========================================================================
+    
+    def detect_dominant_cycle_fft(self, df):
+        """Use FFT to find dominant cycle period"""
+        print(f"\n🔬 STEP 1: FFT Cycle Detection")
+        print("-" * 80)
+        
+        if len(df) < 100:
+            print("❌ Need at least 100 candles")
+            return None
+        
+        prices = df['close'].values
+        detrended = detrend(prices)
+        
+        n = len(detrended)
+        fft_values = rfft(detrended)
+        frequencies = rfftfreq(n, d=1.0)
+        
+        power = np.abs(fft_values) ** 2
+        
+        positive_idx = frequencies > 0
+        frequencies = frequencies[positive_idx]
+        power = power[positive_idx]
+        
+        periods = 1 / frequencies
+        
+        valid_mask = (periods >= self.min_cycle_period) & (periods <= self.max_cycle_period)
+        periods_filtered = periods[valid_mask]
+        power_filtered = power[valid_mask]
+        
+        if len(power_filtered) == 0:
+            print("❌ No cycles found in range")
+            return None
+        
+        dominant_idx = np.argmax(power_filtered)
+        self.dominant_period = periods_filtered[dominant_idx]
+        dominant_power = power_filtered[dominant_idx]
+        
+        period_minutes = self.dominant_period * self.candle_interval
+        period_hours = period_minutes / 60
+        
+        print(f"✅ Dominant Cycle Found:")
+        print(f"   Period: {self.dominant_period:.1f} candles ({period_minutes:.0f} min / {period_hours:.1f} hrs)")
+        print(f"   Strength: {dominant_power:.2e}")
+        
+        # Show top 3 cycles
+        top_3_idx = np.argsort(power_filtered)[-3:][::-1]
+        print(f"\n   Top 3 Cycles:")
+        for i, idx in enumerate(top_3_idx, 1):
+            p = periods_filtered[idx]
+            pwr = power_filtered[idx]
+            print(f"   {i}. {p:.1f} candles ({p*self.candle_interval:.0f} min) - Power: {pwr:.2e}")
+        
+        return self.dominant_period
+    
+    def detect_ohlc_cycles(self):
+        """Detect best cycle for each OHLC price type"""
+        print(f"\n🔬 STEP 2: OHLC Cycle Detection (Refined Search)")
+        print("-" * 80)
+        
+        price_types = ['open', 'high', 'low', 'close']
+        
+        # Use FFT result to narrow search range
+        if self.dominant_period:
+            center = int(self.dominant_period)
+            search_range = range(max(3, center - 10), min(200, center + 10))
+            print(f"Search range: {search_range.start} to {search_range.stop-1} candles (centered on FFT result)")
+        else:
+            search_range = range(3, min(200, len(self.training_data) // 5))
+            print(f"Search range: {search_range.start} to {search_range.stop-1} candles (full range)")
+        
+        for price_type in price_types:
+            prices = self.training_data[price_type].values
+            print(f"\n   Analyzing {price_type.upper()}...")
+            print(f"   Data points: {len(prices)} | Range: {prices.min():.6f} to {prices.max():.6f}")
+            
+            best_results = []
+            
+            for cycle_length in search_range:
+                mae_scores = []
+                
+                for start_pos in range(min(cycle_length, 10)):
+                    predictions = []
+                    actuals = []
+                    
+                    for i in range(start_pos + cycle_length, len(prices), cycle_length):
+                        historical = []
+                        for j in range(i - cycle_length, -1, -cycle_length):
+                            if j >= 0:
+                                historical.append(prices[j])
+                        
+                        if len(historical) >= 2:
+                            pred = np.median(sorted(historical)[-3:] if len(historical) >= 3 else historical)
+                            predictions.append(pred)
+                            actuals.append(prices[i])
+                    
+                    if len(predictions) >= 5:
+                        mae = np.mean(np.abs(np.array(predictions) - np.array(actuals)))
+                        mae_scores.append(mae)
+                
+                if mae_scores:
+                    avg_mae = np.mean(mae_scores)
+                    consistency = np.std(mae_scores)
+                    
+                    best_results.append({
+                        'cycle_length': cycle_length,
+                        'mae': avg_mae,
+                        'consistency': consistency,
+                        'score': avg_mae + (consistency * 0.3)
+                    })
+            
+            best_results.sort(key=lambda x: x['score'])
+            
+            if best_results:
+                self.best_cycles[price_type] = best_results[0]
+                print(f"   ✓ Selected: Cycle {best_results[0]['cycle_length']} (MAE: {best_results[0]['mae']:.8f})")
+        
+        return len(self.best_cycles) == 4
+
+    # ========================================================================
+    # FEATURE ENGINEERING (from chatgpt_v3.py)
+    # ========================================================================
+    
+    def compute_hilbert_features(self, df):
+        """Compute Hilbert transform features"""
+        prices = df['close'].values
+        detrended = detrend(prices)
+        
+        analytic_signal = hilbert(detrended)
+        
+        instantaneous_phase = np.angle(analytic_signal)
+        instantaneous_amplitude = np.abs(analytic_signal)
+        
+        phase_unwrapped = np.unwrap(instantaneous_phase)
+        phase_rate = np.gradient(phase_unwrapped)
+        phase_rate_smooth = pd.Series(phase_rate).rolling(5, min_periods=1).mean().values
+        
+        df['phase'] = instantaneous_phase
+        df['phase_unwrapped'] = phase_unwrapped
+        df['amplitude'] = instantaneous_amplitude
+        df['phase_rate'] = phase_rate_smooth
+        
+        if self.dominant_period:
+            cycle_position = (phase_unwrapped % (2 * np.pi)) / (2 * np.pi)
+            df['cycle_position'] = cycle_position
+        
+        return df
+    
+    def add_market_features(self, df):
+        """Add volatility, momentum, and time features"""
+        # Volatility
+        returns = df['close'].pct_change()
+        df['returns'] = returns
+        df['volatility'] = returns.rolling(10).std()
+        
+        df['vol_percentile'] = df['volatility'].rolling(50, min_periods=10).apply(
+            lambda x: (x.iloc[-1] <= x).sum() / len(x) * 100 if len(x) > 0 else 50
+        )
+        
+        # Momentum
+        df['momentum_1'] = df['close'].pct_change(1)
+        df['momentum_3'] = df['close'].pct_change(3)
+        df['momentum_5'] = df['close'].pct_change(5)
+        
+        # RSI
+        window = 14
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+        rs = gain / (loss + 1e-10)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # Moving averages
+        df['sma_10'] = df['close'].rolling(10).mean()
+        df['sma_20'] = df['close'].rolling(20).mean()
+        df['dist_sma10'] = (df['close'] - df['sma_10']) / (df['sma_10'] + 1e-10)
+        df['dist_sma20'] = (df['close'] - df['sma_20']) / (df['sma_20'] + 1e-10)
+        
+        # Time features
+        df['hour'] = df['timestamp'].dt.hour
+        df['minute'] = df['timestamp'].dt.minute
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+        
+        return df
+
+    # ========================================================================
+    # OHLC PREDICTIONS (from full_OHLC_regimes_different_prices3.py)
+    # ========================================================================
+    
+    def generate_ohlc_predictions(self, target_date, reference_data, actual_data=None):
+        """Generate OHLC predictions using cycle patterns"""
+        
+        if isinstance(target_date, str):
+            target_date = datetime.strptime(target_date, '%Y-%m-%d').replace(tzinfo=self.utc)
+        
+        reference_time = reference_data['timestamp'].iloc[0]
+        predictions = []
+        
+        for minute_offset in range(0, 24 * 60, self.candle_interval):
+            target_time = target_date + timedelta(minutes=minute_offset)
+            
+            pred_record = {
+                'timestamp': target_time,
+                'time_str': target_time.strftime('%H:%M'),
+                'hour': target_time.hour,
+                'minute': target_time.minute
+            }
+            
+            for price_type in ['open', 'high', 'low', 'close']:
+                if price_type not in self.best_cycles:
+                    continue
+                
+                cycle_length = self.best_cycles[price_type]['cycle_length']
+                time_diff = target_time - reference_time
+                intervals = int(time_diff.total_seconds() // (self.candle_interval * 60))
+                position = intervals % cycle_length
+                
+                historical_prices = []
+                for i, row in reference_data.iterrows():
+                    row_time = row['timestamp']
+                    row_time_diff = row_time - reference_time
+                    row_intervals = int(row_time_diff.total_seconds() // (self.candle_interval * 60))
+                    row_position = row_intervals % cycle_length
+                    
+                    if row_position == position:
+                        historical_prices.append(row[price_type])
+                
+                if len(historical_prices) >= 2:
+                    pred = np.median(sorted(historical_prices)[-3:] if len(historical_prices) >= 3 else historical_prices)
+                    pred_record[f'{price_type}_pred'] = pred
+                else:
+                    pred_record[f'{price_type}_pred'] = None
+            
+            # Add actual values if provided
+            if actual_data is not None:
+                actual_row = actual_data[actual_data['timestamp'] == target_time]
+                
+                if not actual_row.empty:
+                    for price_type in ['open', 'high', 'low', 'close']:
+                        actual_val = actual_row.iloc[0][price_type]
+                        pred_val = pred_record.get(f'{price_type}_pred')
+                        
+                        pred_record[f'{price_type}_actual'] = actual_val
+                        
+                        if pred_val is not None:
+                            error = pred_val - actual_val
+                            pred_record[f'{price_type}_error'] = error
+            
+            predictions.append(pred_record)
+        
+        df_pred = pd.DataFrame(predictions)
+        
+        # Add Hilbert and market features
+        temp_df = df_pred.copy()
+        temp_df['close'] = temp_df['close_pred'].fillna(method='ffill').fillna(method='bfill')
+        
+        if len(temp_df) > 50:
+            temp_df = self.compute_hilbert_features(temp_df)
+            temp_df = self.add_market_features(temp_df)
+            
+            # Merge features back
+            feature_cols = ['phase', 'amplitude', 'phase_rate', 'cycle_position', 
+                          'volatility', 'vol_percentile', 'momentum_1', 'momentum_3', 
+                          'rsi', 'dist_sma10', 'hour_sin', 'hour_cos']
+            
+            for col in feature_cols:
+                if col in temp_df.columns:
+                    df_pred[col] = temp_df[col]
+        
+        return df_pred
+
+    # ========================================================================
+    # ML CLASSIFIER (from chatgpt_v3.py)
+    # ========================================================================
+    
+    def train_ml_classifier(self):
+        """Train ML classifier for directional prediction"""
+        print(f"\n{'='*80}")
+        print(f"🤖 STEP 3: TRAINING ML CLASSIFIER")
+        print(f"{'='*80}")
+        
+        # Define feature columns
+        self.feature_cols = [
+            # OHLC predictions as features
+            'open_pred', 'high_pred', 'low_pred', 'close_pred',
+            
+            # Prediction errors (validation only)
+            'open_error', 'high_error', 'low_error', 'close_error',
+            
+            # Hilbert features
+            'phase', 'amplitude', 'phase_rate', 'cycle_position',
+            
+            # Market context
+            'volatility', 'vol_percentile',
+            'momentum_1', 'momentum_3', 'rsi',
+            'dist_sma10',
+            
+            # Time features
+            'hour_sin', 'hour_cos'
+        ]
+        
+        # Create target: next candle direction
+        val_df = self.validation_predictions.copy()
+        
+        # Target: Will next candle close higher than open?
+        val_df['next_close'] = val_df['close_actual'].shift(-1)
+        val_df['next_open'] = val_df['open_actual'].shift(-1)
+        val_df['target'] = (val_df['next_close'] > val_df['next_open']).astype(int)
+        
+        # Remove rows with missing features or target
+        clean_df = val_df[self.feature_cols + ['target']].dropna()
+        
+        if len(clean_df) < 50:
+            print("❌ Insufficient clean data for training")
+            return False
+        
+        X = clean_df[self.feature_cols]
+        y = clean_df['target']
+        
+        print(f"📊 Training Data:")
+        print(f"   Total samples: {len(X)}")
+        print(f"   Features: {len(self.feature_cols)}")
+        print(f"   UP (1): {y.sum()} ({y.mean()*100:.1f}%)")
+        print(f"   DOWN (0): {len(y)-y.sum()} ({(1-y.mean())*100:.1f}%)")
+        
+        # Temporal split (80/20)
+        split_idx = int(len(X) * 0.8)
+        X_train = X.iloc[:split_idx]
+        X_test = X.iloc[split_idx:]
+        y_train = y.iloc[:split_idx]
+        y_test = y.iloc[split_idx:]
+        
+        print(f"\n   Train: {len(X_train)} samples")
+        print(f"   Test:  {len(X_test)} samples")
+        
+        # Train RandomForest
+        print(f"\n🌲 Training Random Forest...")
+        self.rf_model = RandomForestClassifier(
+            n_estimators=50,
+            max_depth=3,
+            min_samples_split=30,
+            min_samples_leaf=15,
+            max_features='sqrt',
+            random_state=42,
+            n_jobs=-1,
+            class_weight='balanced'
+        )
+        self.rf_model.fit(X_train, y_train)
+        
+        # Train GradientBoosting
+        print(f"⚡ Training Gradient Boosting...")
+        self.gb_model = GradientBoostingClassifier(
+            n_estimators=30,
+            max_depth=2,
+            learning_rate=0.03,
+            min_samples_split=30,
+            min_samples_leaf=15,
+            subsample=0.7,
+            random_state=42
+        )
+        self.gb_model.fit(X_train, y_train)
+        
+        # Evaluate ensemble
+        rf_proba = self.rf_model.predict_proba(X_test)[:, 1]
+        gb_proba = self.gb_model.predict_proba(X_test)[:, 1]
+        ensemble_proba = (rf_proba + gb_proba) / 2
+        ensemble_pred = (ensemble_proba > 0.5).astype(int)
+        
+        rf_acc = accuracy_score(y_test, self.rf_model.predict(X_test))
+        gb_acc = accuracy_score(y_test, self.gb_model.predict(X_test))
+        ensemble_acc = accuracy_score(y_test, ensemble_pred)
+        
+        print(f"\n📊 MODEL PERFORMANCE:")
+        print(f"   RandomForest:      {rf_acc*100:.2f}%")
+        print(f"   GradientBoosting:  {gb_acc*100:.2f}%")
+        print(f"   Ensemble:          {ensemble_acc*100:.2f}%")
+        
+        # Check overfitting
+        train_pred = self.rf_model.predict(X_train)
+        train_acc = accuracy_score(y_train, train_pred)
+        overfit_gap = train_acc - ensemble_acc
+        
+        print(f"\n   Train Accuracy:    {train_acc*100:.2f}%")
+        print(f"   Overfit Gap:       {overfit_gap*100:.2f}%")
+        
+        if overfit_gap > 0.15:
+            print(f"   ⚠️  High overfitting detected!")
+        elif overfit_gap > 0.10:
+            print(f"   ⚠️  Moderate overfitting")
+        else:
+            print(f"   ✅ Good generalization")
+        
+        # Feature importance
+        importance_df = pd.DataFrame({
+            'feature': self.feature_cols,
+            'importance': self.rf_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        print(f"\n🎯 Top 10 Features:")
+        for i, row in importance_df.head(10).iterrows():
+            bar = '█' * int(row['importance'] * 50)
+            print(f"   {row['feature']:20s}: {bar} {row['importance']:.4f}")
+        
+        return True
+
+    # ========================================================================
+    # SIGNAL GENERATION
+    # ========================================================================
+    
+    def generate_trading_signals(self, predictions_df, is_validation=False):
+        """Generate trading signals with confidence values"""
+        
+        signals = []
+        
+        # Features for prediction
+        if is_validation:
+            # Use all features including errors
+            required_features = self.feature_cols
+        else:
+            # For today: exclude error columns and set them to 0
+            required_features = [col for col in self.feature_cols if not col.endswith('_error')]
+        
+        for idx, row in predictions_df.iterrows():
+            # Extract features - handle missing columns
+            features = []
+            has_required_data = True
+            
+            for col in self.feature_cols:
+                if col.endswith('_error') and not is_validation:
+                    # Set error features to 0 for today's predictions
+                    features.append(0.0)
+                elif col in row.index and pd.notna(row[col]):
+                    features.append(float(row[col]))
+                elif col in ['open_pred', 'high_pred', 'low_pred', 'close_pred']:
+                    # Critical features - skip this row if missing
+                    has_required_data = False
+                    break
+                else:
+                    # Non-critical features - use 0 as default
+                    features.append(0.0)
+            
+            if not has_required_data or len(features) != len(self.feature_cols):
+                continue
+            
+            features_array = np.array(features).reshape(1, -1)
+            
+            # Get ensemble prediction
+            try:
+                rf_proba = self.rf_model.predict_proba(features_array)[0]
+                gb_proba = self.gb_model.predict_proba(features_array)[0]
+                
+                prob_up = (rf_proba[1] + gb_proba[1]) / 2
+                prob_down = 1 - prob_up
+                
+                if prob_up > 0.5:
+                    signal = "CALL"
+                    confidence = prob_up
+                else:
+                    signal = "PUT"
+                    confidence = prob_down
+                
+                # Price confirmation
+                open_pred = row.get('open_pred')
+                close_pred = row.get('close_pred')
+                
+                price_agrees = False
+                if open_pred is not None and close_pred is not None:
+                    price_agrees = (
+                        (signal == "CALL" and close_pred > open_pred) or
+                        (signal == "PUT" and close_pred < open_pred)
+                    )
+                    
+                    # Boost confidence if price agrees
+                    if price_agrees:
+                        confidence = min(1.0, confidence * 1.05)
+                
+                # Convert timestamp to IST
+                timestamp_utc = row['timestamp']
+                timestamp_ist = timestamp_utc.astimezone(self.ist)
+                
+                signal_data = {
+                    'timestamp': timestamp_utc,
+                    'time': row['time_str'],
+                    'time_ist': timestamp_ist.strftime('%H:%M'),
+                    'signal': signal,
+                    'confidence': confidence,
+                    'prob_up': prob_up,
+                    'prob_down': prob_down,
+                    'open_pred': open_pred,
+                    'close_pred': close_pred,
+                    'price_change_pred': close_pred - open_pred if (open_pred and close_pred) else 0,
+                    'price_agrees': price_agrees,
+                    'hour': row['hour']
+                }
+                
+                # Add actuals if validation
+                if is_validation:
+                    signal_data['open_actual'] = row.get('open_actual')
+                    signal_data['close_actual'] = row.get('close_actual')
+                    signal_data['next_open_actual'] = row.get('next_open_actual')
+                    signal_data['next_close_actual'] = row.get('next_close_actual')
+                
+                signals.append(signal_data)
+                
+            except Exception as e:
+                print(f"Warning: Could not generate signal for {row.get('time_str', 'unknown')}: {e}")
+                continue
+        
+        return pd.DataFrame(signals)
+
+    # ========================================================================
+    # PROPER BACKTESTING
+    # ========================================================================
+    
+    def backtest_strategy(self, min_confidence=0.60, payout=0.80, stake=100):
+        """
+        PROPER BACKTESTING WITH CONFIDENCE FILTERING
+        Tests strategy on validation data (yesterday)
+        """
+        print(f"\n{'='*80}")
+        print(f"📊 BACKTESTING BINARY OPTIONS STRATEGY")
+        print(f"{'='*80}")
+        print(f"📅 Backtest Period: {self.yesterday}")
+        print(f"💰 Payout: {payout*100:.0f}%")
+        print(f"💵 Stake: ${stake} per trade")
+        print(f"🎯 Min Confidence: {min_confidence*100:.0f}%")
+        print(f"{'='*80}")
+        
+        if self.validation_predictions is None:
+            print("❌ No validation predictions available")
+            return None
+        
+        # Add next candle actual values for validation
+        val_df = self.validation_predictions.copy()
+        val_df['next_open_actual'] = val_df['open_actual'].shift(-1)
+        val_df['next_close_actual'] = val_df['close_actual'].shift(-1)
+        
+        # Generate signals
+        signals_df = self.generate_trading_signals(val_df, is_validation=True)
+        
+        if len(signals_df) == 0:
+            print("❌ No signals generated")
+            return None
+        
+        print(f"\n📈 SIGNAL GENERATION:")
+        print(f"   Total signals: {len(signals_df)}")
+        
+        # Calculate actual outcomes
+        signals_df['actual_direction'] = (
+            signals_df['next_close_actual'] > signals_df['next_open_actual']
+        ).map({True: 'CALL', False: 'PUT'})
+        
+        signals_df['correct'] = (
+            signals_df['signal'] == signals_df['actual_direction']
+        ).astype(int)
+        
+        # CONFIDENCE FILTERING - CRITICAL FOR PROFITABILITY
+        print(f"\n🔍 CONFIDENCE FILTERING:")
+        
+        confidence_thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+        backtest_results = []
+        
+        for conf_threshold in confidence_thresholds:
+            filtered = signals_df[signals_df['confidence'] >= conf_threshold].copy()
+            
+            if len(filtered) == 0:
+                continue
+            
+            total_trades = len(filtered)
+            wins = filtered['correct'].sum()
+            losses = total_trades - wins
+            win_rate = wins / total_trades if total_trades > 0 else 0
+            
+            # Calculate PnL
+            total_invested = total_trades * stake
+            total_returned = wins * stake * (1 + payout)
+            total_pnl = total_returned - total_invested
+            roi = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+            
+            # Expected return per trade
+            expected_return = win_rate * payout - (1 - win_rate) * 1.0
+            
+            # Breakeven rate
+            breakeven_rate = 1 / (1 + payout)
+            is_profitable = win_rate > breakeven_rate
+            
+            backtest_results.append({
+                'confidence': conf_threshold,
+                'total_trades': total_trades,
+                'wins': wins,
+                'losses': losses,
+                'win_rate': win_rate,
+                'total_invested': total_invested,
+                'total_pnl': total_pnl,
+                'roi': roi,
+                'expected_return': expected_return,
+                'is_profitable': is_profitable,
+                'edge': (win_rate - breakeven_rate) * 100
+            })
+        
+        # Display results table
+        print(f"\n{'Conf%':<7} {'Trades':<8} {'Wins':<6} {'Win%':<8} {'PnL':<12} {'ROI%':<8} {'Edge%':<8} {'Status':<12}")
+        print("-" * 80)
+        
+        for result in backtest_results:
+            status = "✅ PROFIT" if result['is_profitable'] else "❌ LOSS"
+            print(f"{result['confidence']*100:<7.0f} "
+                  f"{result['total_trades']:<8} "
+                  f"{result['wins']:<6} "
+                  f"{result['win_rate']*100:<8.2f} "
+                  f"${result['total_pnl']:<11,.2f} "
+                  f"{result['roi']:<8.2f} "
+                  f"{result['edge']:<+8.2f} "
+                  f"{status:<12}")
+        
+        # Find optimal confidence threshold
+        profitable_results = [r for r in backtest_results if r['is_profitable']]
+        
+        if profitable_results:
+            # Choose threshold with best ROI among profitable ones
+            best_result = max(profitable_results, key=lambda x: x['roi'])
+            optimal_confidence = best_result['confidence']
+            
+            print(f"\n{'='*80}")
+            print(f"🎯 OPTIMAL CONFIGURATION FOUND")
+            print(f"{'='*80}")
+            print(f"✅ Recommended Min Confidence: {optimal_confidence*100:.0f}%")
+            print(f"   Total Trades: {best_result['total_trades']}")
+            print(f"   Win Rate: {best_result['win_rate']*100:.2f}%")
+            print(f"   Total PnL: ${best_result['total_pnl']:,.2f}")
+            print(f"   ROI: {best_result['roi']:.2f}%")
+            print(f"   Edge over breakeven: {best_result['edge']:+.2f}%")
+            print(f"   Expected return/trade: {best_result['expected_return']*100:+.2f}%")
+            
+        else:
+            print(f"\n{'='*80}")
+            print(f"⚠️  NO PROFITABLE THRESHOLD FOUND")
+            print(f"{'='*80}")
+            print(f"❌ Strategy not profitable at any confidence level")
+            print(f"💡 SUGGESTIONS:")
+            print(f"   - Collect more training data (3-7 days)")
+            print(f"   - Retrain model with different features")
+            print(f"   - Wait for better market conditions")
+            
+            # Show best available
+            if backtest_results:
+                best_available = max(backtest_results, key=lambda x: x['win_rate'])
+                print(f"\n   Best available (not profitable):")
+                print(f"   Min Confidence: {best_available['confidence']*100:.0f}%")
+                print(f"   Win Rate: {best_available['win_rate']*100:.2f}%")
+                print(f"   Need: {(breakeven_rate - best_available['win_rate'])*100:+.2f}% more win rate")
+        
+        # DETAILED ANALYSIS FOR SELECTED CONFIDENCE
+        selected_confidence = min_confidence
+        selected_signals = signals_df[signals_df['confidence'] >= selected_confidence].copy()
+        
+        if len(selected_signals) > 0:
+            print(f"\n{'='*80}")
+            print(f"📊 DETAILED ANALYSIS (Confidence ≥ {selected_confidence*100:.0f}%)")
+            print(f"{'='*80}")
+            
+            # Overall stats
+            total = len(selected_signals)
+            wins = selected_signals['correct'].sum()
+            win_rate = wins / total
+            
+            print(f"\n📈 Overall Performance:")
+            print(f"   Total Trades: {total}")
+            print(f"   Wins: {wins} | Losses: {total - wins}")
+            print(f"   Win Rate: {win_rate*100:.2f}%")
+            print(f"   Breakeven: {breakeven_rate*100:.2f}%")
+            
+            # By signal type
+            print(f"\n📊 By Signal Type:")
+            for signal_type in ['CALL', 'PUT']:
+                signal_subset = selected_signals[selected_signals['signal'] == signal_type]
+                if len(signal_subset) > 0:
+                    sig_wins = signal_subset['correct'].sum()
+                    sig_total = len(signal_subset)
+                    sig_rate = sig_wins / sig_total
+                    print(f"   {signal_type:<4}: {sig_total:>3} trades | {sig_wins:>3} wins | {sig_rate*100:>6.2f}% win rate")
+            
+            # By hour
+            print(f"\n⏰ By Hour of Day:")
+            hourly_stats = selected_signals.groupby('hour').agg({
+                'correct': ['count', 'sum', 'mean']
+            }).round(3)
+            
+            for hour in range(24):
+                hour_data = selected_signals[selected_signals['hour'] == hour]
+                if len(hour_data) > 0:
+                    h_total = len(hour_data)
+                    h_wins = hour_data['correct'].sum()
+                    h_rate = h_wins / h_total
+                    status = "✅" if h_rate > breakeven_rate else "❌"
+                    print(f"   {hour:02d}:00 - {status} {h_total:>2} trades | {h_wins:>2} wins | {h_rate*100:>6.2f}%")
+            
+            # Confidence distribution
+            print(f"\n📊 Confidence Distribution:")
+            conf_bins = [selected_confidence, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 1.0]
+            for i in range(len(conf_bins)-1):
+                bin_signals = selected_signals[
+                    (selected_signals['confidence'] >= conf_bins[i]) & 
+                    (selected_signals['confidence'] < conf_bins[i+1])
+                ]
+                if len(bin_signals) > 0:
+                    bin_wins = bin_signals['correct'].sum()
+                    bin_rate = bin_wins / len(bin_signals)
+                    status = "✅" if bin_rate > breakeven_rate else "❌"
+                    print(f"   {conf_bins[i]:.2f}-{conf_bins[i+1]:.2f}: {status} {len(bin_signals):>3} trades | {bin_rate*100:>6.2f}% win rate")
+            
+            # Confusion Matrix
+            print(f"\n📊 Confusion Matrix:")
+            print(f"   {'':>12} {'Predicted CALL':>16} {'Predicted PUT':>16}")
+            
+            actual_call = selected_signals[selected_signals['actual_direction'] == 'CALL']
+            actual_put = selected_signals[selected_signals['actual_direction'] == 'PUT']
+            
+            call_call = len(actual_call[actual_call['signal'] == 'CALL'])
+            call_put = len(actual_call[actual_call['signal'] == 'PUT'])
+            put_call = len(actual_put[actual_put['signal'] == 'CALL'])
+            put_put = len(actual_put[actual_put['signal'] == 'PUT'])
+            
+            print(f"   {'Actual CALL':>12} {call_call:>16} {call_put:>16}")
+            print(f"   {'Actual PUT':>12} {put_call:>16} {put_put:>16}")
+            
+            # Best and worst trades
+            print(f"\n🏆 Top 5 Most Confident Correct Predictions:")
+            correct_trades = selected_signals[selected_signals['correct'] == 1].nlargest(5, 'confidence')
+            for idx, trade in correct_trades.iterrows():
+                print(f"   {trade['time']} - {trade['signal']} (Conf: {trade['confidence']:.3f})")
+            
+            print(f"\n💔 Top 5 Most Confident Wrong Predictions:")
+            wrong_trades = selected_signals[selected_signals['correct'] == 0].nlargest(5, 'confidence')
+            for idx, trade in wrong_trades.iterrows():
+                print(f"   {trade['time']} - {trade['signal']} (Conf: {trade['confidence']:.3f}) - Was {trade['actual_direction']}")
+        
+        # Save backtest results
+        self.backtest_results = backtest_results
+        self.save_backtest_report(signals_df, backtest_results, selected_confidence)
+        
+        return backtest_results
+
+    # ========================================================================
+    # OUTPUT FILES
+    # ========================================================================
+    
+    def save_backtest_report(self, signals_df, backtest_results, selected_confidence):
+        """Save comprehensive backtest report"""
+        filename = os.path.join(self.output_dir, f"01_BACKTEST_REPORT_{self.yesterday}.txt")
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("="*100 + "\n")
+            f.write(f"BACKTEST REPORT - VALIDATION ON {self.yesterday}\n")
+            f.write("="*100 + "\n")
+            f.write(f"Generated: {datetime.now(self.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+            f.write(f"Training Period: {self.day_before_yesterday}\n")
+            f.write(f"Validation Period: {self.yesterday}\n\n")
+            
+            f.write("CYCLE CONFIGURATION:\n")
+            f.write("-"*60 + "\n")
+            for pt, cycle_info in self.best_cycles.items():
+                f.write(f"{pt.upper():<8} Cycle: {cycle_info['cycle_length']:<4} MAE: {cycle_info['mae']:.8f}\n")
+            
+            f.write(f"\n\nCONFIDENCE THRESHOLD ANALYSIS:\n")
+            f.write("="*100 + "\n")
+            f.write(f"{'Conf%':<7} {'Trades':<8} {'Wins':<6} {'Losses':<7} {'Win%':<8} {'PnL':<12} {'ROI%':<8} {'Edge%':<8} {'Status':<12}\n")
+            f.write("-"*100 + "\n")
+            
+            for result in backtest_results:
+                status = "PROFITABLE" if result['is_profitable'] else "LOSS"
+                f.write(f"{result['confidence']*100:<7.0f} "
+                      f"{result['total_trades']:<8} "
+                      f"{result['wins']:<6} "
+                      f"{result['losses']:<7} "
+                      f"{result['win_rate']*100:<8.2f} "
+                      f"${result['total_pnl']:<11,.2f} "
+                      f"{result['roi']:<8.2f} "
+                      f"{result['edge']:<+8.2f} "
+                      f"{status:<12}\n")
+            
+            # Detailed signals
+            selected_signals = signals_df[signals_df['confidence'] >= selected_confidence]
+            
+            f.write(f"\n\nDETAILED SIGNALS (Confidence ≥ {selected_confidence*100:.0f}%):\n")
+            f.write("="*100 + "\n")
+            f.write(f"{'Time':<6} {'Signal':<6} {'Conf':<6} {'Pred O→C':<12} {'Actual O→C':<12} {'Result':<8}\n")
+            f.write("-"*100 + "\n")
+            
+            for _, sig in selected_signals.iterrows():
+                result = "✓ WIN" if sig['correct'] else "✗ LOSS"
+                pred_change = sig['close_pred'] - sig['open_pred'] if sig['close_pred'] and sig['open_pred'] else 0
+                actual_change = sig['next_close_actual'] - sig['next_open_actual']
+                
+                f.write(f"{sig['time']:<6} "
+                       f"{sig['signal']:<6} "
+                       f"{sig['confidence']:<6.3f} "
+                       f"{pred_change:>+11.6f} "
+                       f"{actual_change:>+11.6f} "
+                       f"{result:<8}\n")
+        
+        print(f"✅ Saved: {filename}")
+    
+    def save_today_signals(self, signals_df):
+        """Save today's trading signals"""
+        filename = os.path.join(self.output_dir, f"02_TODAY_SIGNALS_{self.today}.txt")
+        
+        # Handle empty signals
+        if len(signals_df) == 0:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("="*100 + "\n")
+                f.write(f"TODAY'S TRADING SIGNALS - {self.today}\n")
+                f.write("="*100 + "\n")
+                f.write(f"Generated: {datetime.now(self.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n")
+                f.write("⚠️  NO SIGNALS GENERATED\n")
+                f.write("This can happen if:\n")
+                f.write("  - Not enough historical data for feature calculation\n")
+                f.write("  - Missing required OHLC predictions\n")
+                f.write("  - Technical issues with data processing\n\n")
+                f.write("💡 SUGGESTIONS:\n")
+                f.write("  - Check if training data was fetched successfully\n")
+                f.write("  - Verify OHLC predictions were generated\n")
+                f.write("  - Try running the analysis again\n")
+            
+            print(f"⚠️  Saved empty report: {filename}")
+            return
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("="*100 + "\n")
+            f.write(f"TODAY'S TRADING SIGNALS - {self.today}\n")
+            f.write("="*100 + "\n")
+            f.write(f"Generated: {datetime.now(self.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+            f.write(f"Total Signals: {len(signals_df)}\n\n")
+            
+            # Summary stats
+            call_count = len(signals_df[signals_df['signal'] == 'CALL'])
+            put_count = len(signals_df[signals_df['signal'] == 'PUT'])
+            avg_conf = signals_df['confidence'].mean()
+            
+            f.write(f"SUMMARY:\n")
+            f.write(f"  CALL signals: {call_count} ({call_count/len(signals_df)*100:.1f}%)\n")
+            f.write(f"  PUT signals: {put_count} ({put_count/len(signals_df)*100:.1f}%)\n")
+            f.write(f"  Average confidence: {avg_conf:.3f}\n\n")
+            
+            # Signals by confidence
+            for conf_threshold in [0.70, 0.65, 0.60, 0.55]:
+                high_conf = signals_df[signals_df['confidence'] >= conf_threshold]
+                f.write(f"  Signals ≥{conf_threshold*100:.0f}% confidence: {len(high_conf)}\n")
+            
+            f.write("\n" + "="*100 + "\n")
+            f.write("ALL TRADING SIGNALS:\n")
+            f.write("="*100 + "\n")
+            f.write(f"{'UTC':<6} {'IST':<6} {'Signal':<6} {'Confidence':<12} {'Open Pred':<12} {'Close Pred':<12} {'Change':<12} {'Agree':<6}\n")
+            f.write("-"*100 + "\n")
+            
+            for _, sig in signals_df.iterrows():
+                agree = "✓" if sig['price_agrees'] else "✗"
+                ist_time = sig.get('time_ist', sig['time'])
+                f.write(f"{sig['time']:<6} "
+                       f"{ist_time:<6} "
+                       f"{sig['signal']:<6} "
+                       f"{sig['confidence']:<12.4f} "
+                       f"{sig['open_pred']:<12.6f} "
+                       f"{sig['close_pred']:<12.6f} "
+                       f"{sig['price_change_pred']:>+11.6f} "
+                       f"{agree:<6}\n")
+            
+            # Hourly breakdown
+            f.write("\n" + "="*100 + "\n")
+            f.write("HOURLY BREAKDOWN:\n")
+            f.write("="*100 + "\n")
+            
+            for hour in range(24):
+                hour_signals = signals_df[signals_df['hour'] == hour]
+                if len(hour_signals) > 0:
+                    h_calls = len(hour_signals[hour_signals['signal'] == 'CALL'])
+                    h_puts = len(hour_signals[hour_signals['signal'] == 'PUT'])
+                    h_avg_conf = hour_signals['confidence'].mean()
+                    best_sig = hour_signals.loc[hour_signals['confidence'].idxmax()]
+                    
+                    f.write(f"\nHour {hour:02d}:00 - Total: {len(hour_signals)}, CALL: {h_calls}, PUT: {h_puts}, Avg Conf: {h_avg_conf:.3f}\n")
+                    f.write(f"  Best signal: {best_sig['time']} {best_sig['signal']} (Conf: {best_sig['confidence']:.3f})\n")
+        
+        print(f"✅ Saved: {filename}")
+        
+        # Also save CSV
+        csv_file = os.path.join(self.output_dir, f"02_TODAY_SIGNALS_{self.today}.csv")
+        signals_df.to_csv(csv_file, index=False)
+        print(f"✅ Saved: {csv_file}")
+
+    # ========================================================================
+    # MAIN EXECUTION
+    # ========================================================================
+    
+    def run_complete_analysis(self):
+        """Run complete analysis pipeline"""
+        print(f"\n{'#'*80}")
+        print(f"# RUNNING COMPLETE BINARY OPTIONS ANALYSIS")
+        print(f"{'#'*80}\n")
+        
+        # Step 1: Fetch data
+        print(f"[STEP 1/7] FETCHING DATA")
+        self.training_data = self.fetch_day_data(2, f"Training ({self.day_before_yesterday})")
+        if self.training_data is None:
+            print("❌ Failed to fetch training data")
+            return False
+        
+        self.validation_data = self.fetch_day_data(1, f"Validation ({self.yesterday})")
+        if self.validation_data is None:
+            print("❌ Failed to fetch validation data")
+            return False
+        
+        # Step 2: Cycle detection
+        print(f"\n[STEP 2/7] CYCLE DETECTION")
+        self.detect_dominant_cycle_fft(self.training_data)
+        if not self.detect_ohlc_cycles():
+            print("❌ Failed to detect cycles")
+            return False
+        
+        # Step 3: Generate validation predictions
+        print(f"\n[STEP 3/7] GENERATING VALIDATION PREDICTIONS")
+        self.validation_predictions = self.generate_ohlc_predictions(
+            self.yesterday,
+            self.training_data,
+            self.validation_data
+        )
+        print(f"✅ Generated {len(self.validation_predictions)} validation predictions")
+        
+        # Step 4: Train ML classifier
+        print(f"\n[STEP 4/7] TRAINING ML CLASSIFIER")
+        if not self.train_ml_classifier():
+            print("❌ Failed to train ML classifier")
+            return False
+        
+        # Step 5: Backtest
+        print(f"\n[STEP 5/7] BACKTESTING STRATEGY")
+        backtest_results = self.backtest_strategy(min_confidence=0.60)
+        
+        # Step 6: Generate today's predictions
+        print(f"\n[STEP 6/7] GENERATING TODAY'S PREDICTIONS")
+        self.today_predictions = self.generate_ohlc_predictions(
+            self.today,
+            self.training_data,
+            None
+        )
+        print(f"✅ Generated {len(self.today_predictions)} today predictions")
+        
+        # Step 7: Generate today's signals
+        print(f"\n[STEP 7/7] GENERATING TODAY'S TRADING SIGNALS")
+        today_signals = self.generate_trading_signals(self.today_predictions, is_validation=False)
+        print(f"✅ Generated {len(today_signals)} trading signals")
+        
+        # Save outputs
+        print(f"\n{'='*80}")
+        print(f"💾 SAVING OUTPUT FILES")
+        print(f"{'='*80}")
+        self.save_today_signals(today_signals)
+        
+        # Final summary
+        print(f"\n{'='*80}")
+        print(f"✅ ANALYSIS COMPLETE")
+        print(f"{'='*80}")
+        print(f"📁 Output directory: {self.output_dir}/")
+        print(f"📊 Validation backtest: See 01_BACKTEST_REPORT_{self.yesterday}.txt")
+        print(f"🎯 Today's signals: See 02_TODAY_SIGNALS_{self.today}.txt")
+        
+        if backtest_results:
+            profitable = [r for r in backtest_results if r['is_profitable']]
+            if profitable:
+                best = max(profitable, key=lambda x: x['roi'])
+                print(f"\n🏆 BEST BACKTEST RESULT:")
+                print(f"   Min Confidence: {best['confidence']*100:.0f}%")
+                print(f"   Win Rate: {best['win_rate']*100:.2f}%")
+                print(f"   ROI: {best['roi']:.2f}%")
+                print(f"   Recommended for live trading: YES ✅")
+            else:
+                print(f"\n⚠️  NO PROFITABLE CONFIGURATION FOUND")
+                print(f"   Recommended for live trading: NO ❌")
+        
+        return True
+
+
+# ============================================================================
+# MAIN MENU
+# ============================================================================
+
+def main():
+    predictor = EnhancedBinaryOptionsPredictor()
+    
+    print("\n" + "="*80)
+    print("ENHANCED BINARY OPTIONS PREDICTOR")
+    print("="*80)
+    print("1. Run Complete Analysis (Fetch → Train → Backtest → Predict)")
+    print("2. Backtest Only (requires existing data)")
+    print("3. Exit")
+    print("="*80)
+    
+    choice = input("\nSelect option (1-3): ").strip()
+    
+    if choice == '1':
+        predictor.run_complete_analysis()
+    elif choice == '2':
+        print("\nBacktest only mode - fetching data first...")
+        predictor.training_data = predictor.fetch_day_data(2, "Training")
+        predictor.validation_data = predictor.fetch_day_data(1, "Validation")
+        
+        if predictor.training_data is not None and predictor.validation_data is not None:
+            predictor.detect_dominant_cycle_fft(predictor.training_data)
+            predictor.detect_ohlc_cycles()
+            predictor.validation_predictions = predictor.generate_ohlc_predictions(
+                predictor.yesterday, predictor.training_data, predictor.validation_data
+            )
+            predictor.train_ml_classifier()
+            predictor.backtest_strategy()
+    elif choice == '3':
+        print("\n👋 Goodbye!")
+    else:
+        print("❌ Invalid option")
+
+
+if __name__ == "__main__":
+    main()
