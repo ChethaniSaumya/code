@@ -1,0 +1,1657 @@
+"""
+BINARY OPTIONS 5-MIN PREDICTOR
+Cycle Detection + Time-Based Volatility + AI Classifier
+Predicts CALL/PUT for next 5-minute candle close
+
+IMPROVEMENTS TO PREVENT OVERFITTING:
+✅ Reduced feature set (17 → 12 features) - only most important
+✅ Stronger regularization (max_depth=4, min_samples=20)
+✅ Ensemble method (RandomForest + GradientBoosting)
+✅ Class balancing to handle imbalanced data
+✅ Overfitting gap monitoring (train vs test)
+✅ Walk-forward validation with adaptive retraining
+
+KEY FEATURES:
+- FFT for cycle detection (10-50 candles)
+- Hilbert transform for phase/amplitude
+- Time-based volatility filtering
+- Binary classifier optimized for >55% win rate
+- Real-time API integration
+- Backtesting with realistic payout simulation
+"""
+
+import pandas as pd
+import numpy as np
+import requests
+from datetime import datetime, timedelta, timezone
+from scipy.signal import hilbert, detrend
+from scipy.fft import rfft, rfftfreq
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+import joblib
+import json
+import os
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class BinaryOptionsPredictor:
+    """
+    Binary Options predictor using cycle detection + volatility + AI
+    Designed for 5-minute expiry (predict next candle direction)
+    """
+    
+    def __init__(self):
+        # API Configuration (same as provided code)
+        self.API_BASE = "https://api.binomo.com/candles/v1/Z-CRY%2FIDX"
+        self.HEADERS = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        }
+        self.utc = timezone.utc
+        
+        # Trading parameters
+        self.candle_interval = 5  # 5 minutes
+        self.expiry_candles = 1   # Next candle (5 min)
+        
+        # Cycle parameters
+        self.min_cycle_period = 10   # 10 candles = 50 min
+        self.max_cycle_period = 50   # 50 candles = 250 min
+        self.dominant_period = None
+        
+        # Volatility parameters
+        self.vol_window = 10  # 10 candles for rolling volatility
+        self.vol_percentile_low = 20
+        self.vol_percentile_high = 80
+        
+        # AI Model
+        self.model = None
+        self.feature_cols = []
+        self.model_accuracy = 0
+        
+        # Trading history
+        self.trade_history = []
+        self.live_signals = []
+        
+        # Directories
+        self.models_dir = os.path.abspath("binary_models")
+        self.logs_dir = os.path.abspath("binary_logs")
+        os.makedirs(self.models_dir, exist_ok=True)
+        os.makedirs(self.logs_dir, exist_ok=True)
+        
+        print("🎯 Binary Options 5-Min Predictor Initialized")
+        print(f"   Expiry: {self.candle_interval} minutes")
+        print(f"   Target: Next candle direction (UP/DOWN)")
+
+    # ========================================================================
+    # DATA FETCHING (Same API as provided)
+    # ========================================================================
+    
+    def parse_api_timestamp(self, timestamp_str):
+        """Parse API timestamp"""
+        try:
+            if timestamp_str.endswith('Z'):
+                dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            else:
+                dt = datetime.fromisoformat(timestamp_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=self.utc)
+            return dt
+        except Exception as e:
+            print(f"✗ Error parsing timestamp: {e}")
+            return None
+    
+    def fetch_recent_candles(self, days_back=7, limit=None):
+        """
+        Fetch recent 5-minute candles
+        For binary options, we need recent data (last few days/weeks)
+        
+        Args:
+            days_back: number of days to fetch
+            limit: maximum number of candles (None = no limit)
+        """
+        print(f"\n📥 Fetching last {days_back} days of 5-min candles...")
+        
+        utc_now = datetime.now(self.utc)
+        start_date = (utc_now - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        all_data = []
+        
+        # Fetch day by day
+        for day_offset in range(days_back, 0, -1):
+            target_date = (utc_now - timedelta(days=day_offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+            date_str = target_date.strftime("%Y-%m-%dT00:00:00")
+            url = f"{self.API_BASE}/{date_str}/300?locale=en"
+            
+            try:
+                response = requests.get(url, headers=self.HEADERS, timeout=10)
+                if response.status_code == 200:
+                    api_data = response.json()
+                    
+                    if 'data' in api_data and len(api_data['data']) > 0:
+                        for candle in api_data['data']:
+                            dt = self.parse_api_timestamp(candle['created_at'])
+                            if dt is None:
+                                continue
+                            
+                            all_data.append({
+                                'timestamp': dt,
+                                'open': float(candle['open']),
+                                'high': float(candle['high']),
+                                'low': float(candle['low']),
+                                'close': float(candle['close'])
+                            })
+                
+                # Progress indicator
+                if day_offset % 10 == 0:
+                    print(f"   Progress: {days_back - day_offset}/{days_back} days fetched ({len(all_data)} candles so far)")
+                
+                time.sleep(0.1)  # Rate limiting
+                
+            except Exception as e:
+                print(f"✗ Error fetching day {day_offset}: {e}")
+                continue
+        
+        if not all_data:
+            print("❌ No data retrieved")
+            return None
+        
+        df = pd.DataFrame(all_data)
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        
+        # Apply limit only if specified
+        if limit is not None and len(df) > limit:
+            print(f"   ⚠️  Limiting to most recent {limit} candles (from {len(df)} total)")
+            df = df.tail(limit).reset_index(drop=True)
+        
+        print(f"✓ Retrieved {len(df)} candles")
+        print(f"   From: {df['timestamp'].min()}")
+        print(f"   To:   {df['timestamp'].max()}")
+        
+        # Show data density
+        total_days = (df['timestamp'].max() - df['timestamp'].min()).days + 1
+        expected_candles = total_days * 24 * 12  # 12 candles per hour
+        completeness = (len(df) / expected_candles) * 100 if expected_candles > 0 else 0
+        
+        print(f"   Span: {total_days} days")
+        print(f"   Completeness: {completeness:.1f}% ({len(df)}/{expected_candles} expected)")
+        
+        if completeness < 80:
+            print(f"   ⚠️  WARNING: Significant data gaps detected")
+            print(f"   This may affect model performance")
+        
+        return df
+
+    # ========================================================================
+    # CYCLE DETECTION (FFT + Hilbert Transform)
+    # ========================================================================
+    
+    def detect_dominant_cycle(self, df):
+        """
+        Use FFT to find dominant cycle period
+        Focus on short-term cycles (10-50 candles)
+        """
+        print(f"\n🔍 Detecting Dominant Cycle (FFT Analysis)...")
+        
+        if len(df) < 100:
+            print("❌ Need at least 100 candles")
+            return None
+        
+        # Detrend closing prices
+        prices = df['close'].values
+        detrended = detrend(prices)
+        
+        # Apply FFT
+        n = len(detrended)
+        fft_values = rfft(detrended)
+        frequencies = rfftfreq(n, d=1.0)  # d=1 means 1 candle spacing
+        
+        # Power spectrum
+        power = np.abs(fft_values) ** 2
+        
+        # Only positive frequencies
+        positive_idx = frequencies > 0
+        frequencies = frequencies[positive_idx]
+        power = power[positive_idx]
+        
+        # Convert to periods (in candles)
+        periods = 1 / frequencies
+        
+        # Filter to our range of interest (10-50 candles)
+        valid_mask = (periods >= self.min_cycle_period) & (periods <= self.max_cycle_period)
+        periods_filtered = periods[valid_mask]
+        power_filtered = power[valid_mask]
+        
+        if len(power_filtered) == 0:
+            print("❌ No cycles found in range")
+            return None
+        
+        # Find dominant period
+        dominant_idx = np.argmax(power_filtered)
+        self.dominant_period = periods_filtered[dominant_idx]
+        dominant_power = power_filtered[dominant_idx]
+        
+        # Convert to time
+        period_minutes = self.dominant_period * self.candle_interval
+        period_hours = period_minutes / 60
+        
+        print(f"✅ Dominant Cycle Found:")
+        print(f"   Period: {self.dominant_period:.1f} candles ({period_minutes:.0f} min / {period_hours:.1f} hrs)")
+        print(f"   Strength: {dominant_power:.2e}")
+        
+        # Find top 3 cycles
+        top_3_idx = np.argsort(power_filtered)[-3:][::-1]
+        print(f"\n   Top 3 Cycles:")
+        for i, idx in enumerate(top_3_idx, 1):
+            p = periods_filtered[idx]
+            pwr = power_filtered[idx]
+            print(f"   {i}. {p:.1f} candles ({p*self.candle_interval:.0f} min) - Power: {pwr:.2e}")
+        
+        return self.dominant_period
+    
+    def compute_hilbert_features(self, df):
+        """
+        Compute Hilbert transform to get instantaneous phase and amplitude
+        This tells us WHERE we are in the cycle
+        """
+        print(f"\n🌊 Computing Hilbert Transform Features...")
+        
+        # Detrend prices
+        prices = df['close'].values
+        detrended = detrend(prices)
+        
+        # Hilbert transform gives analytic signal
+        analytic_signal = hilbert(detrended)
+        
+        # Extract phase and amplitude
+        instantaneous_phase = np.angle(analytic_signal)  # -π to π
+        instantaneous_amplitude = np.abs(analytic_signal)
+        
+        # Unwrap phase to make it continuous
+        phase_unwrapped = np.unwrap(instantaneous_phase)
+        
+        # Phase derivative (rate of phase change)
+        phase_rate = np.gradient(phase_unwrapped)
+        
+        # Smooth phase rate
+        phase_rate_smooth = pd.Series(phase_rate).rolling(5, min_periods=1).mean().values
+        
+        # Add to dataframe
+        df['phase'] = instantaneous_phase
+        df['phase_unwrapped'] = phase_unwrapped
+        df['amplitude'] = instantaneous_amplitude
+        df['phase_rate'] = phase_rate_smooth
+        
+        # Cycle position: where are we in the cycle? (0 to 1)
+        if self.dominant_period:
+            cycle_position = (phase_unwrapped % (2 * np.pi)) / (2 * np.pi)
+            df['cycle_position'] = cycle_position
+        
+        print(f"✅ Hilbert features computed")
+        print(f"   Current phase: {df['phase'].iloc[-1]:.3f} rad")
+        print(f"   Current amplitude: {df['amplitude'].iloc[-1]:.6f}")
+        
+        return df
+
+    # ========================================================================
+    # FEATURE ENGINEERING (Cycle + Volatility + Momentum)
+    # ========================================================================
+    
+    def engineer_features(self, df):
+        """
+        Create all features for AI model:
+        - Cycle features (phase, amplitude, position)
+        - Volatility features (rolling std, percentile)
+        - Momentum features (returns, RSI, MACD)
+        """
+        print(f"\n⚙️ Engineering Features for AI Model...")
+        
+        df = df.copy()
+        
+        # 1. CYCLE FEATURES (already computed by Hilbert)
+        # phase, amplitude, phase_rate, cycle_position
+        
+        # 2. VOLATILITY FEATURES
+        returns = df['close'].pct_change()
+        df['returns'] = returns
+        
+        # Rolling volatility
+        df['volatility'] = returns.rolling(self.vol_window).std()
+        
+        # Volatility percentile (where current vol ranks)
+        df['vol_percentile'] = df['volatility'].rolling(50, min_periods=10).apply(
+            lambda x: (x.iloc[-1] <= x).sum() / len(x) * 100
+        )
+        
+        # Volatility regime (low/medium/high)
+        df['vol_regime'] = pd.cut(
+            df['vol_percentile'],
+            bins=[0, 33, 66, 100],
+            labels=['low', 'medium', 'high']
+        )
+        
+        # 3. MOMENTUM FEATURES
+        # Simple momentum
+        df['momentum_1'] = df['close'].pct_change(1)
+        df['momentum_3'] = df['close'].pct_change(3)
+        df['momentum_5'] = df['close'].pct_change(5)
+        
+        # RSI (simplified)
+        window = 14
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+        rs = gain / (loss + 1e-10)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        ema_12 = df['close'].ewm(span=12).mean()
+        ema_26 = df['close'].ewm(span=26).mean()
+        df['macd'] = ema_12 - ema_26
+        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        df['macd_diff'] = df['macd'] - df['macd_signal']
+        
+        # 4. PRICE FEATURES
+        # Distance from moving averages
+        df['sma_10'] = df['close'].rolling(10).mean()
+        df['sma_20'] = df['close'].rolling(20).mean()
+        df['dist_sma10'] = (df['close'] - df['sma_10']) / df['sma_10']
+        df['dist_sma20'] = (df['close'] - df['sma_20']) / df['sma_20']
+        
+        # 5. TIME-BASED FEATURES
+        df['hour'] = df['timestamp'].dt.hour
+        df['minute'] = df['timestamp'].dt.minute
+        df['day_of_week'] = df['timestamp'].dt.dayofweek
+        
+        # Cyclical encoding
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+        
+        # 6. TARGET: Next candle direction
+        df['target'] = (df['close'].shift(-1) > df['close']).astype(int)  # 1 = UP, 0 = DOWN
+        
+        print(f"✅ Features engineered: {len(df.columns)} total columns")
+        
+        return df
+
+    # ========================================================================
+    # AI MODEL TRAINING
+    # ========================================================================
+    
+    def train_ai_model(self, df, test_size=0.2, use_ensemble=True):
+        """
+        Train AI classifier with improved regularization
+        Options: RandomForest, GradientBoosting, Logistic, or Ensemble
+        """
+        print(f"\n{'='*80}")
+        print(f"🤖 TRAINING AI CLASSIFIER")
+        print(f"{'='*80}")
+        
+        # Define feature columns - REDUCED to most important only
+        self.feature_cols = [
+            # Top cycle features (proven important)
+            'amplitude', 'phase_rate', 'phase',
+            
+            # Volatility features
+            'volatility', 'vol_percentile',
+            
+            # Key momentum features
+            'momentum_1', 'momentum_3',
+            'rsi',
+            
+            # Price features
+            'dist_sma10',
+            
+            # Time features (minimal)
+            'hour_sin', 'hour_cos'
+        ]
+        
+        # Add cycle_position if available
+        if 'cycle_position' in df.columns:
+            self.feature_cols.append('cycle_position')
+        
+        # Remove NaN rows
+        df_clean = df[self.feature_cols + ['target']].dropna()
+        
+        if len(df_clean) < 100:
+            print("❌ Insufficient clean data for training")
+            return False
+        
+        X = df_clean[self.feature_cols]
+        y = df_clean['target']
+        
+        # DATA QUALITY CHECK
+        print(f"📊 Training Data:")
+        print(f"   Total samples: {len(X)}")
+        print(f"   Features: {len(self.feature_cols)} (reduced for stability)")
+        print(f"   UP (1): {y.sum()} ({y.mean()*100:.1f}%)")
+        print(f"   DOWN (0): {len(y)-y.sum()} ({(1-y.mean())*100:.1f}%)")
+        
+        # Check class balance
+        class_ratio = min(y.sum(), len(y) - y.sum()) / len(y)
+        if class_ratio < 0.3:
+            print(f"   ⚠️  WARNING: Severe class imbalance (ratio={class_ratio:.2f})")
+        
+        # Check if we have enough data
+        if len(X) < 200:
+            print(f"   ⚠️  WARNING: Limited training data. Consider fetching more days.")
+        
+        # Split: use temporal split (no shuffle)
+        split_idx = int(len(X) * (1 - test_size))
+        X_train = X.iloc[:split_idx]
+        X_test = X.iloc[split_idx:]
+        y_train = y.iloc[:split_idx]
+        y_test = y.iloc[split_idx:]
+        
+        print(f"\n   Train: {len(X_train)} samples")
+        print(f"   Test:  {len(X_test)} samples")
+        
+        # Ensure minimum test size
+        if len(X_test) < 20:
+            print(f"   ⚠️  WARNING: Very small test set ({len(X_test)} samples)")
+        
+        if use_ensemble:
+            print(f"\n🎯 Training Ensemble (RF + GradientBoost + Logistic)...")
+            
+            # Model 1: RandomForest with VERY STRONG regularization
+            rf_model = RandomForestClassifier(
+                n_estimators=50,  # Reduced from 100
+                max_depth=3,  # Even shallower (was 4)
+                min_samples_split=30,  # Increased from 20
+                min_samples_leaf=15,  # Increased from 10
+                max_features='sqrt',
+                random_state=42,
+                n_jobs=-1,
+                class_weight='balanced'
+            )
+            
+            # Model 2: GradientBoosting with aggressive regularization
+            gb_model = GradientBoostingClassifier(
+                n_estimators=30,  # Reduced from 50
+                max_depth=2,  # Very shallow (was 3)
+                learning_rate=0.03,  # Slower learning (was 0.05)
+                min_samples_split=30,
+                min_samples_leaf=15,
+                subsample=0.7,  # Use only 70% of data per tree
+                random_state=42
+            )
+            
+            # Model 3: Logistic Regression (linear baseline)
+            from sklearn.linear_model import LogisticRegression
+            lr_model = LogisticRegression(
+                C=0.1,  # Strong L2 regularization
+                max_iter=1000,
+                random_state=42,
+                class_weight='balanced'
+            )
+            
+            # Train all three
+            rf_model.fit(X_train, y_train)
+            gb_model.fit(X_train, y_train)
+            lr_model.fit(X_train, y_train)
+            
+            # Evaluate all three
+            rf_pred_test = rf_model.predict(X_test)
+            gb_pred_test = gb_model.predict(X_test)
+            lr_pred_test = lr_model.predict(X_test)
+            
+            rf_acc = accuracy_score(y_test, rf_pred_test)
+            gb_acc = accuracy_score(y_test, gb_pred_test)
+            lr_acc = accuracy_score(y_test, lr_pred_test)
+            
+            print(f"   RandomForest Test Acc: {rf_acc*100:.2f}%")
+            print(f"   GradientBoost Test Acc: {gb_acc*100:.2f}%")
+            print(f"   LogisticReg Test Acc: {lr_acc*100:.2f}%")
+            
+            # Store all models
+            self.model = rf_model  # Primary
+            self.model_ensemble = {
+                'rf': rf_model,
+                'gb': gb_model,
+                'lr': lr_model
+            }
+            
+            # Use weighted ensemble prediction (best model gets more weight)
+            rf_proba = rf_model.predict_proba(X_test)[:, 1]
+            gb_proba = gb_model.predict_proba(X_test)[:, 1]
+            lr_proba = lr_model.predict_proba(X_test)[:, 1]
+            
+            # Weight by individual accuracy
+            total_acc = rf_acc + gb_acc + lr_acc
+            rf_weight = rf_acc / total_acc
+            gb_weight = gb_acc / total_acc
+            lr_weight = lr_acc / total_acc
+            
+            ensemble_proba = (rf_proba * rf_weight + 
+                            gb_proba * gb_weight + 
+                            lr_proba * lr_weight)
+            ensemble_pred = (ensemble_proba > 0.5).astype(int)
+            
+            test_acc = accuracy_score(y_test, ensemble_pred)
+            self.model_accuracy = test_acc
+            
+            print(f"   Weighted Ensemble Test Acc: {test_acc*100:.2f}%")
+            print(f"   Weights: RF={rf_weight:.2f}, GB={gb_weight:.2f}, LR={lr_weight:.2f}")
+            
+        else:
+            # Single model with strong regularization
+            print(f"\n🌲 Training Random Forest...")
+            self.model = RandomForestClassifier(
+                n_estimators=50,
+                max_depth=3,
+                min_samples_split=30,
+                min_samples_leaf=15,
+                max_features='sqrt',
+                random_state=42,
+                n_jobs=-1,
+                class_weight='balanced'
+            )
+            
+            self.model.fit(X_train, y_train)
+            
+            # Evaluate
+            train_pred = self.model.predict(X_train)
+            test_pred = self.model.predict(X_test)
+            
+            train_acc = accuracy_score(y_train, train_pred)
+            test_acc = accuracy_score(y_test, test_pred)
+            
+            self.model_accuracy = test_acc
+        
+        # Check train-test gap (overfitting indicator)
+        train_pred = self.model.predict(X_train)
+        train_acc = accuracy_score(y_train, train_pred)
+        
+        overfit_gap = train_acc - self.model_accuracy
+        
+        print(f"\n📊 RESULTS:")
+        print(f"   Train Accuracy: {train_acc*100:.2f}%")
+        print(f"   Test Accuracy:  {self.model_accuracy*100:.2f}%")
+        print(f"   Overfit Gap:    {overfit_gap*100:.2f}%")
+        
+        if overfit_gap > 0.15:
+            print(f"   ⚠️  WARNING: High overfitting detected! Gap > 15%")
+            print(f"   💡 SUGGESTION: Fetch more data (14-30 days) or increase min_confidence")
+        elif overfit_gap > 0.10:
+            print(f"   ⚠️  Moderate overfitting. Gap = {overfit_gap*100:.1f}%")
+        else:
+            print(f"   ✅ Good generalization. Gap < 10%")
+        
+        # Feature importance
+        importance_df = pd.DataFrame({
+            'feature': self.feature_cols,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        print(f"\n🎯 Feature Importance:")
+        for i, row in importance_df.head(10).iterrows():
+            bar = '█' * int(row['importance'] * 100)
+            print(f"   {row['feature']:20s}: {bar} {row['importance']:.4f}")
+        
+        # Binary options profitability check
+        payout = 0.80
+        win_rate = self.model_accuracy
+        expected_return = win_rate * payout - (1 - win_rate) * 1.0
+        
+        print(f"\n💰 BINARY OPTIONS ANALYSIS (80% payout):")
+        print(f"   Win Rate: {win_rate*100:.2f}%")
+        print(f"   Expected Return per Trade: {expected_return*100:+.2f}%")
+        print(f"   Breakeven: 55.56% win rate")
+        
+        if expected_return > 0:
+            print(f"   ✅ PROFITABLE (positive edge)")
+        else:
+            gap_to_breakeven = 0.5556 - win_rate
+            print(f"   ⚠️  NOT PROFITABLE (need {gap_to_breakeven*100:+.2f}% more)")
+            print(f"   💡 SUGGESTIONS:")
+            print(f"      - Increase min_confidence threshold (trade less, win more)")
+            print(f"      - Fetch more training data (14-30 days)")
+            print(f"      - Wait for higher volatility periods")
+        
+        # Detailed classification report
+        test_pred = self.model.predict(X_test)
+        print(f"\n📋 Classification Report:")
+        print(classification_report(y_test, test_pred, target_names=['DOWN', 'UP']))
+        
+        return True
+        """
+        Train AI classifier with improved regularization
+        Options: RandomForest, GradientBoosting, or Ensemble
+        """
+        print(f"\n{'='*80}")
+        print(f"🤖 TRAINING AI CLASSIFIER")
+        print(f"{'='*80}")
+        
+        # Define feature columns - REDUCED to most important only
+        self.feature_cols = [
+            # Top cycle features (proven important)
+            'amplitude', 'phase_rate', 'phase',
+            
+            # Volatility features
+            'volatility', 'vol_percentile',
+            
+            # Key momentum features
+            'momentum_1', 'momentum_3',
+            'rsi',
+            
+            # Price features
+            'dist_sma10',
+            
+            # Time features (minimal)
+            'hour_sin', 'hour_cos'
+        ]
+        
+        # Add cycle_position if available
+        if 'cycle_position' in df.columns:
+            self.feature_cols.append('cycle_position')
+        
+        # Remove NaN rows
+        df_clean = df[self.feature_cols + ['target']].dropna()
+        
+        if len(df_clean) < 100:
+            print("❌ Insufficient clean data for training")
+            return False
+        
+        X = df_clean[self.feature_cols]
+        y = df_clean['target']
+        
+        print(f"📊 Training Data:")
+        print(f"   Total samples: {len(X)}")
+        print(f"   Features: {len(self.feature_cols)} (reduced for stability)")
+        print(f"   UP (1): {y.sum()} ({y.mean()*100:.1f}%)")
+        print(f"   DOWN (0): {len(y)-y.sum()} ({(1-y.mean())*100:.1f}%)")
+        
+        # Split: use temporal split (no shuffle)
+        split_idx = int(len(X) * (1 - test_size))
+        X_train = X.iloc[:split_idx]
+        X_test = X.iloc[split_idx:]
+        y_train = y.iloc[:split_idx]
+        y_test = y.iloc[split_idx:]
+        
+        print(f"\n   Train: {len(X_train)} samples")
+        print(f"   Test:  {len(X_test)} samples")
+        
+        if use_ensemble:
+            print(f"\n🎯 Training Ensemble (RF + GradientBoost + Logistic)...")
+            
+            # Model 1: RandomForest with VERY STRONG regularization
+            rf_model = RandomForestClassifier(
+                n_estimators=50,  # Reduced from 100
+                max_depth=3,  # Even shallower (was 4)
+                min_samples_split=30,  # Increased from 20
+                min_samples_leaf=15,  # Increased from 10
+                max_features='sqrt',
+                random_state=42,
+                n_jobs=-1,
+                class_weight='balanced'
+            )
+            
+            # Model 2: GradientBoosting with aggressive regularization
+            gb_model = GradientBoostingClassifier(
+                n_estimators=30,  # Reduced from 50
+                max_depth=2,  # Very shallow (was 3)
+                learning_rate=0.03,  # Slower learning (was 0.05)
+                min_samples_split=30,
+                min_samples_leaf=15,
+                subsample=0.7,  # Use only 70% of data per tree
+                random_state=42
+            )
+            
+            # Model 3: Logistic Regression (linear baseline)
+            from sklearn.linear_model import LogisticRegression
+            lr_model = LogisticRegression(
+                C=0.1,  # Strong L2 regularization
+                max_iter=1000,
+                random_state=42,
+                class_weight='balanced'
+            )
+            
+            # Train all three
+            rf_model.fit(X_train, y_train)
+            gb_model.fit(X_train, y_train)
+            lr_model.fit(X_train, y_train)
+            
+            # Evaluate all three
+            rf_pred_test = rf_model.predict(X_test)
+            gb_pred_test = gb_model.predict(X_test)
+            lr_pred_test = lr_model.predict(X_test)
+            
+            rf_acc = accuracy_score(y_test, rf_pred_test)
+            gb_acc = accuracy_score(y_test, gb_pred_test)
+            lr_acc = accuracy_score(y_test, lr_pred_test)
+            
+            print(f"   RandomForest Test Acc: {rf_acc*100:.2f}%")
+            print(f"   GradientBoost Test Acc: {gb_acc*100:.2f}%")
+            print(f"   LogisticReg Test Acc: {lr_acc*100:.2f}%")
+            
+            # Store all models
+            self.model = rf_model  # Primary
+            self.model_ensemble = {
+                'rf': rf_model,
+                'gb': gb_model,
+                'lr': lr_model
+            }
+            
+            # Use weighted ensemble prediction (best model gets more weight)
+            rf_proba = rf_model.predict_proba(X_test)[:, 1]
+            gb_proba = gb_model.predict_proba(X_test)[:, 1]
+            lr_proba = lr_model.predict_proba(X_test)[:, 1]
+            
+            # Weight by individual accuracy
+            total_acc = rf_acc + gb_acc + lr_acc
+            rf_weight = rf_acc / total_acc
+            gb_weight = gb_acc / total_acc
+            lr_weight = lr_acc / total_acc
+            
+            ensemble_proba = (rf_proba * rf_weight + 
+                            gb_proba * gb_weight + 
+                            lr_proba * lr_weight)
+            ensemble_pred = (ensemble_proba > 0.5).astype(int)
+            
+            test_acc = accuracy_score(y_test, ensemble_pred)
+            self.model_accuracy = test_acc
+            
+            print(f"   Weighted Ensemble Test Acc: {test_acc*100:.2f}%")
+            print(f"   Weights: RF={rf_weight:.2f}, GB={gb_weight:.2f}, LR={lr_weight:.2f}")
+            
+        else:
+            # Single model with strong regularization
+            print(f"\n🌲 Training Random Forest...")
+            self.model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=4,
+                min_samples_split=20,
+                min_samples_leaf=10,
+                max_features='sqrt',
+                random_state=42,
+                n_jobs=-1,
+                class_weight='balanced'
+            )
+            
+            self.model.fit(X_train, y_train)
+            
+            # Evaluate
+            train_pred = self.model.predict(X_train)
+            test_pred = self.model.predict(X_test)
+            
+            train_acc = accuracy_score(y_train, train_pred)
+            test_acc = accuracy_score(y_test, test_pred)
+            
+            self.model_accuracy = test_acc
+        
+        # Check train-test gap (overfitting indicator)
+        train_pred = self.model.predict(X_train)
+        train_acc = accuracy_score(y_train, train_pred)
+        
+        overfit_gap = train_acc - self.model_accuracy
+        
+        print(f"\n📊 RESULTS:")
+        print(f"   Train Accuracy: {train_acc*100:.2f}%")
+        print(f"   Test Accuracy:  {self.model_accuracy*100:.2f}%")
+        print(f"   Overfit Gap:    {overfit_gap*100:.2f}%")
+        
+        if overfit_gap > 0.15:
+            print(f"   ⚠️  WARNING: High overfitting detected! Gap > 15%")
+        elif overfit_gap > 0.10:
+            print(f"   ⚠️  Moderate overfitting. Gap = {overfit_gap*100:.1f}%")
+        else:
+            print(f"   ✅ Good generalization. Gap < 10%")
+        
+        # Feature importance
+        importance_df = pd.DataFrame({
+            'feature': self.feature_cols,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        print(f"\n🎯 Feature Importance:")
+        for i, row in importance_df.head(10).iterrows():
+            bar = '█' * int(row['importance'] * 100)
+            print(f"   {row['feature']:20s}: {bar} {row['importance']:.4f}")
+        
+        # Binary options profitability check
+        payout = 0.80
+        win_rate = self.model_accuracy
+        expected_return = win_rate * payout - (1 - win_rate) * 1.0
+        
+        print(f"\n💰 BINARY OPTIONS ANALYSIS (80% payout):")
+        print(f"   Win Rate: {win_rate*100:.2f}%")
+        print(f"   Expected Return per Trade: {expected_return*100:+.2f}%")
+        
+        if expected_return > 0:
+            print(f"   ✅ PROFITABLE (positive edge)")
+        else:
+            print(f"   ⚠️  NOT PROFITABLE (need >55.6% win rate)")
+        
+        # Detailed classification report
+        test_pred = self.model.predict(X_test)
+        print(f"\n📋 Classification Report:")
+        print(classification_report(y_test, test_pred, target_names=['DOWN', 'UP']))
+        
+        return True
+    
+    def predict_next_candle(self, df):
+        """
+        Predict next candle direction using trained model
+        Uses weighted ensemble if available
+        Returns: 'CALL' or 'PUT' with confidence
+        """
+        if self.model is None:
+            print("❌ Model not trained")
+            return None
+        
+        # Get latest features
+        latest = df[self.feature_cols].iloc[-1:].copy()
+        
+        # Check for NaN
+        if latest.isnull().any().any():
+            print("⚠️  Warning: NaN values in features")
+            latest = latest.fillna(0)
+        
+        # Predict using ensemble if available
+        if hasattr(self, 'model_ensemble') and self.model_ensemble:
+            # Get predictions from all models
+            probas = []
+            weights = []
+            
+            for model_name, model in self.model_ensemble.items():
+                proba = model.predict_proba(latest)[0]
+                probas.append(proba)
+                
+                # Use equal weights (or could use trained weights)
+                weights.append(1.0 / len(self.model_ensemble))
+            
+            # Weighted average of probabilities
+            proba = np.average(probas, axis=0, weights=weights)
+            prediction = 1 if proba[1] > 0.5 else 0
+            confidence = proba[prediction]
+            
+        else:
+            # Single model prediction
+            prediction = self.model.predict(latest)[0]
+            proba = self.model.predict_proba(latest)[0]
+            confidence = proba[prediction]
+        
+        signal = "CALL" if prediction == 1 else "PUT"
+        
+        return {
+            'signal': signal,
+            'prediction': prediction,
+            'confidence': confidence,
+            'probability_up': proba[1],
+            'probability_down': proba[0]
+        }
+
+    # ========================================================================
+    # BACKTESTING
+    # ========================================================================
+    
+    def backtest_strategy(self, df, payout=0.80, stake=100, min_confidence=0.60):
+        """
+        Backtest the strategy on historical data
+        Simulates binary options trading with 5-min expiry
+        
+        Args:
+            df: DataFrame with historical data
+            payout: Payout ratio (0.80 = 80%)
+            stake: Amount per trade
+            min_confidence: Minimum confidence to take trade (default 0.60 = 60%)
+        """
+        print(f"\n{'='*80}")
+        print(f"📊 BACKTESTING BINARY OPTIONS STRATEGY")
+        print(f"{'='*80}")
+        print(f"💡 Using min_confidence={min_confidence*100:.0f}% filter")
+        
+        if self.model is None:
+            print("❌ Model not trained")
+            return None
+        
+        # Prepare data
+        df_clean = df[self.feature_cols + ['close', 'timestamp', 'target']].dropna().copy()
+        
+        if len(df_clean) < 50:
+            print("❌ Insufficient data")
+            return None
+        
+        # Generate predictions with probabilities
+        X = df_clean[self.feature_cols]
+        
+        # Get predictions from ensemble if available
+        if hasattr(self, 'model_ensemble') and self.model_ensemble:
+            # Get predictions from all models
+            all_probas = []
+            for model_name, model in self.model_ensemble.items():
+                proba = model.predict_proba(X)[:, 1]  # Probability of UP
+                all_probas.append(proba)
+            
+            # Average probabilities
+            proba_up = np.mean(all_probas, axis=0)
+            predictions = (proba_up > 0.5).astype(int)
+            
+        else:
+            predictions = self.model.predict(X)
+            proba_up = self.model.predict_proba(X)[:, 1]
+        
+        df_clean['prediction'] = predictions
+        df_clean['proba_up'] = proba_up
+        df_clean['proba_down'] = 1 - proba_up
+        
+        # Calculate confidence (distance from 0.5)
+        df_clean['confidence'] = np.abs(proba_up - 0.5) + 0.5
+        
+        # ⭐ CRITICAL: Only trade when confidence exceeds threshold
+        df_clean['trade'] = (df_clean['confidence'] >= min_confidence).astype(int)
+        
+        # Calculate results
+        df_clean['correct'] = (df_clean['prediction'] == df_clean['target']).astype(int)
+        df_clean['pnl'] = 0.0
+        
+        # Calculate PnL for each trade
+        for idx in df_clean[df_clean['trade'] == 1].index:
+            if df_clean.loc[idx, 'correct'] == 1:
+                df_clean.loc[idx, 'pnl'] = stake * payout  # Win
+            else:
+                df_clean.loc[idx, 'pnl'] = -stake  # Loss
+        
+        # Cumulative PnL
+        df_clean['cumulative_pnl'] = df_clean['pnl'].cumsum()
+        
+        # Statistics
+        total_trades = df_clean['trade'].sum()
+        winning_trades = df_clean[df_clean['trade'] == 1]['correct'].sum()
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        
+        total_pnl = df_clean['cumulative_pnl'].iloc[-1]
+        max_pnl = df_clean['cumulative_pnl'].max()
+        min_pnl = df_clean['cumulative_pnl'].min()
+        max_drawdown = max_pnl - min_pnl
+        
+        # Expected return per trade
+        expected_return = win_rate * payout - (1 - win_rate) * 1.0
+        
+        print(f"\n📊 BACKTEST RESULTS:")
+        print(f"   Period: {df_clean['timestamp'].iloc[0]} to {df_clean['timestamp'].iloc[-1]}")
+        print(f"   Total Candles: {len(df_clean)}")
+        print(f"   Potential Trades: {len(df_clean)} (all candles)")
+        print(f"   ⭐ FILTERED Trades: {total_trades} ({total_trades/len(df_clean)*100:.1f}% taken)")
+        print(f"   Skipped (low confidence): {len(df_clean) - total_trades}")
+        print(f"   Winning Trades: {winning_trades}")
+        print(f"   Win Rate: {win_rate*100:.2f}%")
+        
+        print(f"\n💰 PROFITABILITY:")
+        print(f"   Stake per Trade: ${stake}")
+        print(f"   Payout: {payout*100:.0f}%")
+        print(f"   Min Confidence: {min_confidence*100:.0f}%")
+        print(f"   Total PnL: ${total_pnl:,.2f}")
+        print(f"   Max Drawdown: ${max_drawdown:,.2f}")
+        
+        if total_trades > 0:
+            roi = (total_pnl / (stake * total_trades)) * 100
+            print(f"   ROI: {roi:+.2f}%")
+            print(f"   Expected Return/Trade: {expected_return*100:+.2f}%")
+            
+            # Profitability check
+            breakeven_rate = 1 / (1 + payout)
+            print(f"\n📈 ANALYSIS:")
+            print(f"   Breakeven Rate: {breakeven_rate*100:.2f}%")
+            
+            if win_rate > breakeven_rate:
+                profit_per_trade = expected_return * stake
+                print(f"   ✅ PROFITABLE!")
+                print(f"   Expected profit per trade: ${profit_per_trade:+.2f}")
+                print(f"   Edge over breakeven: {(win_rate - breakeven_rate)*100:+.2f}%")
+            else:
+                gap = (breakeven_rate - win_rate) * 100
+                print(f"   ⚠️  NOT PROFITABLE")
+                print(f"   Need {gap:+.2f}% more win rate")
+                print(f"   💡 Try increasing min_confidence to 0.65 or 0.70")
+        else:
+            print(f"   ROI: N/A (no trades)")
+            print(f"\n⚠️  No trades met confidence threshold of {min_confidence*100:.0f}%")
+            print(f"   💡 Lower min_confidence to get more trades")
+        
+        # Save backtest results
+        self.backtest_results = {
+            'total_candles': int(len(df_clean)),
+            'total_trades': int(total_trades),
+            'winning_trades': int(winning_trades),
+            'win_rate': float(win_rate),
+            'total_pnl': float(total_pnl),
+            'max_drawdown': float(max_drawdown),
+            'payout': payout,
+            'stake': stake,
+            'min_confidence': min_confidence,
+            'expected_return': float(expected_return) if total_trades > 0 else 0
+        }
+        
+        # Show confidence distribution
+        print(f"\n📊 Confidence Distribution:")
+        conf_bins = [0.5, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 1.0]
+        for i in range(len(conf_bins)-1):
+            count = ((df_clean['confidence'] >= conf_bins[i]) & 
+                    (df_clean['confidence'] < conf_bins[i+1])).sum()
+            pct = (count / len(df_clean)) * 100
+            print(f"   {conf_bins[i]:.2f}-{conf_bins[i+1]:.2f}: {count:6d} ({pct:5.2f}%)")
+        
+        return df_clean
+
+    # ========================================================================
+    # LIVE TRADING MODE
+    # ========================================================================
+    
+    def live_trading_loop(self, check_interval=300, min_confidence=0.60):
+        """
+        Live trading loop - SYNCHRONIZED with 5-minute candle closures
+        
+        Args:
+            check_interval: seconds between checks (300 = 5 min)
+            min_confidence: minimum confidence to take trade (0.6 = 60%)
+        """
+        print(f"\n{'='*80}")
+        print(f"🔴 LIVE BINARY OPTIONS TRADING")
+        print(f"{'='*80}")
+        print(f"⏰ Candle Interval: {self.candle_interval} minutes")
+        print(f"🎯 Expiry: Next {self.candle_interval}-minute candle close")
+        print(f"📊 Min Confidence: {min_confidence*100:.0f}%")
+        print(f"🔄 SYNCED with candle boundaries (00, 05, 10, 15...)")
+        print(f"Press Ctrl+C to stop\n")
+        
+        if self.model is None:
+            print("❌ Model not trained! Train first.")
+            return
+        
+        iteration = 0
+        
+        try:
+            while True:
+                iteration += 1
+                utc_now = datetime.now(self.utc)
+                
+                # ============================================================
+                # CRITICAL: SYNC WITH CANDLE CLOSURE
+                # ============================================================
+                
+                current_minute = utc_now.minute
+                current_second = utc_now.second
+                
+                # Calculate next candle close time
+                # Candles close at: 00, 05, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55
+                minutes_into_current_candle = current_minute % self.candle_interval
+                seconds_into_current_candle = minutes_into_current_candle * 60 + current_second
+                
+                # Time until current candle closes
+                seconds_until_candle_close = (self.candle_interval * 60) - seconds_into_current_candle
+                
+                # Current candle close time
+                current_candle_close = utc_now + timedelta(seconds=seconds_until_candle_close)
+                current_candle_close = current_candle_close.replace(second=0, microsecond=0)
+                
+                # Next candle close time (expiry for our trade)
+                next_candle_close = current_candle_close + timedelta(minutes=self.candle_interval)
+                
+                # We should make prediction JUST BEFORE current candle closes
+                # Ideal time: 10-30 seconds before candle close
+                optimal_prediction_time = current_candle_close - timedelta(seconds=20)
+                
+                print(f"\n{'='*80}")
+                print(f"🔄 Iteration #{iteration}")
+                print(f"⏰ Current Time: {utc_now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                print(f"📍 Current Candle Closes: {current_candle_close.strftime('%H:%M:%S UTC')}")
+                print(f"🎯 Next Candle Closes (Expiry): {next_candle_close.strftime('%H:%M:%S UTC')}")
+                print(f"⏳ Seconds until current close: {seconds_until_candle_close:.0f}s")
+                print(f"{'='*80}")
+                
+                # ============================================================
+                # TIMING LOGIC
+                # ============================================================
+                
+                # If we're more than 1 minute before candle close, wait
+                if seconds_until_candle_close > 60:
+                    wait_time = seconds_until_candle_close - 30  # Wake up 30s before close
+                    print(f"\n⏸️  Waiting for candle to mature...")
+                    print(f"   Will check again in {wait_time:.0f} seconds")
+                    print(f"   (at {(utc_now + timedelta(seconds=wait_time)).strftime('%H:%M:%S')})")
+                    time.sleep(min(wait_time, 60))  # Sleep max 60s at a time
+                    continue
+                
+                # If we're in the prediction window (10-60 seconds before close)
+                elif 10 <= seconds_until_candle_close <= 60:
+                    print(f"\n✅ OPTIMAL PREDICTION WINDOW")
+                    print(f"   Fetching data and making prediction...")
+                    
+                    # Fetch recent data
+                    print("\n1️⃣ Fetching data...")
+                    df = self.fetch_recent_candles(days_back=3, limit=300)  # Last 3 days, max 300 candles
+                    
+                    if df is None or len(df) < 100:
+                        print("❌ Insufficient data")
+                        time.sleep(30)
+                        continue
+                    
+                    # Detect cycle
+                    print("\n2️⃣ Analyzing cycle...")
+                    self.detect_dominant_cycle(df)
+                    
+                    # Compute features
+                    print("\n3️⃣ Computing features...")
+                    df = self.compute_hilbert_features(df)
+                    df = self.engineer_features(df)
+                    
+                    # Make prediction
+                    print("\n4️⃣ Making prediction...")
+                    prediction = self.predict_next_candle(df)
+                    
+                    if prediction is None:
+                        print("❌ Prediction failed")
+                        time.sleep(30)
+                        continue
+                    
+                    # Display signal
+                    current_price = df['close'].iloc[-1]
+                    signal = prediction['signal']
+                    confidence = prediction['confidence']
+                    prob_up = prediction['probability_up']
+                    prob_down = prediction['probability_down']
+                    
+                    print(f"\n{'='*80}")
+                    print(f"🎯 TRADING SIGNAL FOR NEXT CANDLE")
+                    print(f"{'='*80}")
+                    print(f"⏰ Signal Time: {utc_now.strftime('%H:%M:%S UTC')}")
+                    print(f"💰 Current Price: {current_price:.10f}")
+                    print(f"🔔 Entry Candle Close: {current_candle_close.strftime('%H:%M:%S UTC')}")
+                    print(f"🎯 EXPIRY (Next Close): {next_candle_close.strftime('%H:%M:%S UTC')}")
+                    print(f"\n📊 Prediction:")
+                    print(f"   Signal: {'🟢' if signal == 'CALL' else '🔴'} {signal}")
+                    print(f"   Confidence: {confidence*100:.1f}%")
+                    print(f"   Prob UP:   {prob_up*100:.1f}%")
+                    print(f"   Prob DOWN: {prob_down*100:.1f}%")
+                    
+                    # Trade decision
+                    if confidence >= min_confidence:
+                        emoji = "🚀" if signal == "CALL" else "💥"
+                        print(f"\n{emoji} EXECUTE TRADE: {signal}")
+                        print(f"   Entry: NOW (before {current_candle_close.strftime('%H:%M:%S')})")
+                        print(f"   Expiry: {next_candle_close.strftime('%H:%M:%S')} ({self.candle_interval} min)")
+                        action = "TRADE"
+                    else:
+                        print(f"\n⏸️  SKIP: Confidence too low ({confidence*100:.1f}% < {min_confidence*100:.0f}%)")
+                        action = "SKIP"
+                    
+                    print(f"{'='*80}")
+                    
+                    # Log signal
+                    signal_data = {
+                        'timestamp': utc_now.isoformat(),
+                        'price': float(current_price),
+                        'signal': signal,
+                        'confidence': float(confidence),
+                        'prob_up': float(prob_up),
+                        'prob_down': float(prob_down),
+                        'action': action,
+                        'entry_candle_close': current_candle_close.isoformat(),
+                        'expiry_candle_close': next_candle_close.isoformat(),
+                        'seconds_before_close': int(seconds_until_candle_close),
+                        'cycle_period': float(self.dominant_period) if self.dominant_period else None
+                    }
+                    
+                    self.live_signals.append(signal_data)
+                    
+                    # Save logs
+                    self.save_live_logs()
+                    
+                    # Wait until after current candle closes, then wait for next cycle
+                    wait_until_next_cycle = seconds_until_candle_close + 10
+                    print(f"\n⏳ Waiting {wait_until_next_cycle:.0f}s until next prediction window...")
+                    time.sleep(wait_until_next_cycle)
+                
+                # If we're too close to close (<10 seconds), wait for next candle
+                else:
+                    print(f"\n⚠️  Too close to candle close ({seconds_until_candle_close:.0f}s)")
+                    print(f"   Waiting for next candle...")
+                    time.sleep(seconds_until_candle_close + 10)
+                    continue
+                
+        except KeyboardInterrupt:
+            print(f"\n\n🛑 Live trading stopped by user")
+            print(f"📊 Session Summary:")
+            print(f"   Total iterations: {iteration}")
+            print(f"   Total signals: {len(self.live_signals)}")
+            
+            if self.live_signals:
+                call_signals = len([s for s in self.live_signals if s['signal'] == 'CALL'])
+                put_signals = len([s for s in self.live_signals if s['signal'] == 'PUT'])
+                trades_taken = len([s for s in self.live_signals if s['action'] == 'TRADE'])
+                
+                print(f"   CALL signals: {call_signals}")
+                print(f"   PUT signals: {put_signals}")
+                print(f"   Trades taken: {trades_taken}")
+                
+                avg_confidence = np.mean([s['confidence'] for s in self.live_signals])
+                print(f"   Avg confidence: {avg_confidence*100:.1f}%")
+            
+            self.save_live_logs()
+            print(f"\n✅ Logs saved to {self.logs_dir}")
+
+    # ========================================================================
+    # WALK-FORWARD TRAINING (Adaptive Learning)
+    # ========================================================================
+    
+    def walk_forward_train(self, df, retrain_every_hours=3):
+        """
+        Walk-forward training: retrain model periodically with latest data
+        This keeps the model adaptive to changing market conditions
+        """
+        print(f"\n{'='*80}")
+        print(f"🔄 WALK-FORWARD ADAPTIVE TRAINING")
+        print(f"{'='*80}")
+        print(f"Retrain frequency: Every {retrain_every_hours} hours")
+        
+        # Calculate candles per retrain window
+        candles_per_window = int(retrain_every_hours * 60 / self.candle_interval)
+        
+        print(f"Window size: {candles_per_window} candles")
+        
+        # We'll retrain on rolling 200-candle windows
+        train_window = 200
+        
+        if len(df) < train_window + 50:
+            print("❌ Need more data for walk-forward")
+            return False
+        
+        results = []
+        
+        # Start from first complete window
+        for i in range(train_window, len(df), candles_per_window):
+            print(f"\n--- Training Window {i//candles_per_window + 1} ---")
+            
+            # Training data: last 200 candles up to position i
+            train_df = df.iloc[max(0, i-train_window):i].copy()
+            
+            # Test data: next candles_per_window candles
+            test_df = df.iloc[i:min(i+candles_per_window, len(df))].copy()
+            
+            if len(test_df) < 10:
+                break
+            
+            print(f"Train: {len(train_df)} candles, Test: {len(test_df)} candles")
+            
+            # Train on this window
+            self.train_ai_model(train_df, test_size=0.2)
+            
+            # Test on forward period
+            X_test = test_df[self.feature_cols].dropna()
+            y_test = test_df['target'].loc[X_test.index]
+            
+            if len(X_test) > 0:
+                y_pred = self.model.predict(X_test)
+                accuracy = accuracy_score(y_test, y_pred)
+                
+                results.append({
+                    'window': i//candles_per_window + 1,
+                    'accuracy': accuracy,
+                    'trades': len(y_test)
+                })
+                
+                print(f"Forward accuracy: {accuracy*100:.2f}%")
+        
+        # Summary
+        print(f"\n{'='*80}")
+        print(f"WALK-FORWARD RESULTS SUMMARY")
+        print(f"{'='*80}")
+        
+        if results:
+            avg_accuracy = np.mean([r['accuracy'] for r in results])
+            print(f"Average accuracy across windows: {avg_accuracy*100:.2f}%")
+            print(f"Total windows tested: {len(results)}")
+            
+            for r in results:
+                print(f"  Window {r['window']}: {r['accuracy']*100:.2f}% ({r['trades']} trades)")
+        
+        return True
+
+    # ========================================================================
+    # SAVE & LOAD
+    # ========================================================================
+    
+    def save_model(self, filename="binary_model.pkl"):
+        """Save trained model"""
+        if self.model is None:
+            print("❌ No model to save")
+            return False
+        
+        model_path = os.path.join(self.models_dir, filename)
+        
+        model_data = {
+            'model': self.model,
+            'feature_cols': self.feature_cols,
+            'dominant_period': self.dominant_period,
+            'accuracy': self.model_accuracy,
+            'timestamp': datetime.now(self.utc).isoformat()
+        }
+        
+        joblib.dump(model_data, model_path)
+        print(f"✅ Model saved to {model_path}")
+        return True
+    
+    def load_model(self, filename="binary_model.pkl"):
+        """Load trained model"""
+        model_path = os.path.join(self.models_dir, filename)
+        
+        if not os.path.exists(model_path):
+            print(f"❌ Model not found: {model_path}")
+            return False
+        
+        try:
+            model_data = joblib.load(model_path)
+            self.model = model_data['model']
+            self.feature_cols = model_data['feature_cols']
+            self.dominant_period = model_data['dominant_period']
+            self.model_accuracy = model_data['accuracy']
+            
+            print(f"✅ Model loaded from {model_path}")
+            print(f"   Accuracy: {self.model_accuracy*100:.2f}%")
+            print(f"   Features: {len(self.feature_cols)}")
+            
+            return True
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            return False
+    
+    def save_live_logs(self):
+        """Save live trading signals"""
+        if not self.live_signals:
+            return
+        
+        log_path = os.path.join(self.logs_dir, "live_signals.json")
+        
+        with open(log_path, 'w') as f:
+            json.dump(self.live_signals, f, indent=2)
+    
+    def save_backtest_results(self):
+        """Save backtest results"""
+        if not hasattr(self, 'backtest_results'):
+            return
+        
+        log_path = os.path.join(self.logs_dir, "backtest_results.json")
+        
+        with open(log_path, 'w') as f:
+            json.dump(self.backtest_results, f, indent=2)
+
+    # ========================================================================
+    # ANALYSIS & REPORTING
+    # ========================================================================
+    
+    def analyze_performance(self):
+        """Analyze model and trading performance"""
+        print(f"\n{'='*80}")
+        print(f"📊 PERFORMANCE ANALYSIS")
+        print(f"{'='*80}")
+        
+        if self.model is None:
+            print("❌ No model trained")
+            return
+        
+        print(f"\n🤖 Model Performance:")
+        print(f"   Accuracy: {self.model_accuracy*100:.2f}%")
+        print(f"   Features: {len(self.feature_cols)}")
+        
+        if hasattr(self, 'backtest_results'):
+            results = self.backtest_results
+            print(f"\n📈 Backtest Results:")
+            print(f"   Total Trades: {results['total_trades']}")
+            print(f"   Win Rate: {results['win_rate']*100:.2f}%")
+            print(f"   Total PnL: ${results['total_pnl']:,.2f}")
+            print(f"   Max Drawdown: ${results['max_drawdown']:,.2f}")
+        
+        if self.live_signals:
+            print(f"\n🔴 Live Trading Stats:")
+            print(f"   Total Signals: {len(self.live_signals)}")
+            
+            call_count = len([s for s in self.live_signals if s['signal'] == 'CALL'])
+            put_count = len([s for s in self.live_signals if s['signal'] == 'PUT'])
+            
+            print(f"   CALL: {call_count} ({call_count/len(self.live_signals)*100:.1f}%)")
+            print(f"   PUT: {put_count} ({put_count/len(self.live_signals)*100:.1f}%)")
+            
+            avg_conf = np.mean([s['confidence'] for s in self.live_signals])
+            print(f"   Avg Confidence: {avg_conf*100:.1f}%")
+
+
+# ============================================================================
+# MAIN MENU
+# ============================================================================
+
+def main_menu():
+    """Main menu for binary options predictor"""
+    predictor = BinaryOptionsPredictor()
+    df = None
+    
+    while True:
+        print("\n" + "="*80)
+        print("🎯 BINARY OPTIONS 5-MIN PREDICTOR (Cycle + AI)")
+        print("="*80)
+        print("📥 DATA:")
+        print("  1. Fetch Historical Data (5-min candles)")
+        print("\n🔬 ANALYSIS:")
+        print("  2. Detect Dominant Cycle (FFT)")
+        print("  3. Compute Hilbert Features (Phase & Amplitude)")
+        print("  4. Engineer All Features")
+        print("\n🤖 AI MODEL:")
+        print("  5. Train AI Classifier")
+        print("  6. Save Model")
+        print("  7. Load Model")
+        print("  8. Walk-Forward Training (Adaptive)")
+        print("\n📊 BACKTESTING:")
+        print("  9. Backtest Strategy")
+        print("  10. Analyze Performance")
+        print("\n🔴 LIVE TRADING:")
+        print("  11. Start Live Trading Loop")
+        print("  12. Single Prediction (Current)")
+        print("\n❌ EXIT:")
+        print("  13. Exit")
+        print("="*80)
+        
+        choice = input("\nSelect option (1-13): ").strip()
+        
+        if choice == '1':
+            days = int(input("Days of history (default 7): ") or "7")
+            
+            # Warn if requesting too many days
+            if days > 30:
+                print(f"⚠️  Requesting {days} days may take a while...")
+                print(f"   Estimated candles: ~{days * 288} (288 per day)")
+                confirm = input("Continue? (y/n): ").strip().lower()
+                if confirm != 'y':
+                    continue
+            
+            df = predictor.fetch_recent_candles(days_back=days, limit=None)  # No limit
+            
+            if df is not None:
+                print(f"\n✅ Data loaded: {len(df)} candles")
+                
+                # Show daily breakdown
+                df['date'] = df['timestamp'].dt.date
+                daily_counts = df.groupby('date').size()
+                
+                print(f"\n📊 Daily Breakdown:")
+                print(f"   Total days: {len(daily_counts)}")
+                print(f"   Avg candles/day: {daily_counts.mean():.0f}")
+                print(f"   Min candles/day: {daily_counts.min()}")
+                print(f"   Max candles/day: {daily_counts.max()}")
+                
+                # Show first and last few days
+                print(f"\n   First 5 days:")
+                for date, count in daily_counts.head(5).items():
+                    print(f"      {date}: {count} candles")
+                
+                if len(daily_counts) > 5:
+                    print(f"   ...")
+                    print(f"   Last 5 days:")
+                    for date, count in daily_counts.tail(5).items():
+                        print(f"      {date}: {count} candles")
+        
+        elif choice == '2':
+            if df is None:
+                print("❌ Fetch data first (option 1)")
+                continue
+            
+            predictor.detect_dominant_cycle(df)
+        
+        elif choice == '3':
+            if df is None:
+                print("❌ Fetch data first (option 1)")
+                continue
+            
+            df = predictor.compute_hilbert_features(df)
+        
+        elif choice == '4':
+            if df is None:
+                print("❌ Fetch data first (option 1)")
+                continue
+            
+            # Run full pipeline
+            predictor.detect_dominant_cycle(df)
+            df = predictor.compute_hilbert_features(df)
+            df = predictor.engineer_features(df)
+            
+            print(f"\n✅ All features ready!")
+            print(f"   Total columns: {len(df.columns)}")
+        
+        elif choice == '5':
+            if df is None:
+                print("❌ Fetch and prepare data first (options 1, 4)")
+                continue
+            
+            # Ensure features are computed
+            if 'phase' not in df.columns:
+                print("Computing features first...")
+                predictor.detect_dominant_cycle(df)
+                df = predictor.compute_hilbert_features(df)
+                df = predictor.engineer_features(df)
+            
+            test_size = float(input("Test size (default 0.2): ") or "0.2")
+            predictor.train_ai_model(df, test_size=test_size)
+        
+        elif choice == '6':
+            filename = input("Filename (default binary_model.pkl): ").strip() or "binary_model.pkl"
+            predictor.save_model(filename)
+        
+        elif choice == '7':
+            filename = input("Filename (default binary_model.pkl): ").strip() or "binary_model.pkl"
+            if predictor.load_model(filename):
+                # After loading model, check if we need to fetch data
+                if df is None:
+                    print("\n💡 Model loaded, but no data available.")
+                    fetch = input("Fetch data now? (y/n): ").strip().lower()
+                    if fetch == 'y':
+                        days = int(input("Days of history (default 30): ") or "30")
+                        df = predictor.fetch_recent_candles(days_back=days, limit=None)
+                        
+                        if df is not None:
+                            print(f"✓ Data loaded: {len(df)} candles")
+                            
+                            # Process features automatically
+                            print("\n🔄 Processing features for loaded model...")
+                            predictor.detect_dominant_cycle(df)
+                            df = predictor.compute_hilbert_features(df)
+                            df = predictor.engineer_features(df)
+                            print("✓ Features ready for backtesting/live trading")
+                else:
+                    print("\n✓ Model loaded and data is already available")
+        
+        elif choice == '8':
+            if df is None:
+                print("❌ Fetch data first (option 1)")
+                continue
+            
+            if 'phase' not in df.columns:
+                print("Computing features first...")
+                predictor.detect_dominant_cycle(df)
+                df = predictor.compute_hilbert_features(df)
+                df = predictor.engineer_features(df)
+            
+            hours = int(input("Retrain every N hours (default 3): ") or "3")
+            predictor.walk_forward_train(df, retrain_every_hours=hours)
+        
+        elif choice == '9':
+            if df is None or predictor.model is None:
+                print("❌ Need data and trained model")
+                continue
+            
+            payout = float(input("Payout ratio (default 0.80 = 80%): ") or "0.80")
+            stake = float(input("Stake per trade (default 100): ") or "100")
+            min_conf = float(input("Min confidence to trade (default 0.60 = 60%): ") or "0.60")
+            
+            print(f"\n💡 Only trades with ≥{min_conf*100:.0f}% confidence will be taken")
+            
+            backtest_df = predictor.backtest_strategy(df, payout=payout, stake=stake, min_confidence=min_conf)
+            predictor.save_backtest_results()
+        
+        elif choice == '10':
+            predictor.analyze_performance()
+        
+        elif choice == '11':
+            if predictor.model is None:
+                print("❌ Train or load model first")
+                continue
+            
+            interval = int(input("Check interval seconds (default 300 = 5min): ") or "300")
+            min_conf = float(input("Min confidence to trade (default 0.60): ") or "0.60")
+            
+            print(f"\n🎯 Starting live trading...")
+            print(f"   Checking every {interval}s")
+            print(f"   Trading when confidence > {min_conf*100:.0f}%")
+            
+            confirm = input("\nStart? (y/n): ").strip().lower()
+            if confirm == 'y':
+                predictor.live_trading_loop(check_interval=interval, min_confidence=min_conf)
+        
+        elif choice == '12':
+            if predictor.model is None:
+                print("❌ Train or load model first")
+                continue
+            
+            print("\n🔄 Fetching latest data...")
+            df = predictor.fetch_recent_candles(days_back=3, limit=300)
+            
+            if df is not None:
+                predictor.detect_dominant_cycle(df)
+                df = predictor.compute_hilbert_features(df)
+                df = predictor.engineer_features(df)
+                
+                prediction = predictor.predict_next_candle(df)
+                
+                if prediction:
+                    print(f"\n{'='*60}")
+                    print(f"🎯 CURRENT PREDICTION")
+                    print(f"{'='*60}")
+                    print(f"Signal: {'🟢 CALL' if prediction['signal'] == 'CALL' else '🔴 PUT'}")
+                    print(f"Confidence: {prediction['confidence']*100:.1f}%")
+                    print(f"Prob UP: {prediction['probability_up']*100:.1f}%")
+                    print(f"Prob DOWN: {prediction['probability_down']*100:.1f}%")
+                    print(f"{'='*60}")
+        
+        elif choice == '13':
+            print("\n👋 Thank you for using Binary Options Predictor!")
+            break
+        
+        else:
+            print("❌ Invalid option")
+
+
+if __name__ == "__main__":
+    print("""
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║                                                               ║
+    ║     BINARY OPTIONS 5-MIN PREDICTOR                           ║
+    ║     Cycle Detection + Time-Based Volatility + AI             ║
+    ║                                                               ║
+    ║     Predicts: CALL/PUT for next 5-minute candle              ║
+    ║     Method: FFT → Hilbert → Features → RandomForest          ║
+    ║                                                               ║
+    ╚═══════════════════════════════════════════════════════════════╝
+    """)
+    
+    main_menu()
+
